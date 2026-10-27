@@ -860,7 +860,18 @@ static __global__ void mul_mat_vec_q(
                         }
                     }
                 }
-                dst[j*stride_col_dst + i] = result;
+                float * out = dst + j*stride_col_dst + i;
+                if constexpr (has_fusion) {
+                    if (fusion.split_dst1) {
+                        const uint32_t row = row0 + i;
+                        if (row >= fusion.split_row2) {
+                            out = fusion.split_dst2 + (row - fusion.split_row2);
+                        } else if (row >= fusion.split_row1) {
+                            out = fusion.split_dst1 + (row - fusion.split_row1);
+                        }
+                    }
+                }
+                *out = result;
             }
         }
     }
@@ -1054,7 +1065,7 @@ static void mul_mat_vec_q_switch_fusion(
         const uint32_t ids_stride, cudaStream_t stream) {
 
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
-                            fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
+                            fusion.x_scale != nullptr || fusion.gate_scale != nullptr || fusion.split_dst1 != nullptr;
     if constexpr (c_ncols_dst == 1) {
         if (has_fusion) {
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
@@ -1519,6 +1530,14 @@ void ggml_cuda_mul_mat_vec_q(
         if (fusion->gate) {
             GGML_ASSERT(fusion->gate->type == src0->type && ggml_are_same_stride(fusion->gate, src0));
             fusion_local.gate = fusion->gate->data;
+        }
+        if (fusion->split_dst[0]) {
+            GGML_ASSERT(!ids && dst->ne[1] == 1 && fusion->split_dst[1]);
+            GGML_ASSERT(0 < fusion->split_row[0] && fusion->split_row[0] < fusion->split_row[1] && fusion->split_row[1] < dst->ne[0]);
+            fusion_local.split_dst1 = (float *) fusion->split_dst[0]->data;
+            fusion_local.split_dst2 = (float *) fusion->split_dst[1]->data;
+            fusion_local.split_row1 = fusion->split_row[0];
+            fusion_local.split_row2 = fusion->split_row[1];
         }
         if (fusion->gate_bias) {
             GGML_ASSERT(fusion->gate_bias->type == GGML_TYPE_F32);

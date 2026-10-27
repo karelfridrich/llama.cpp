@@ -1996,6 +1996,30 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     return use_mul_mat_vec_q;
 }
 
+// b starts right after a in device memory with the same row layout, so both can be read as one weight matrix
+static bool ggml_cuda_weights_adjacent(const ggml_tensor * a, const ggml_tensor * b) {
+    return a->op == GGML_OP_NONE && b->op == GGML_OP_NONE && a->buffer && a->buffer == b->buffer &&
+           ggml_backend_buffer_is_cuda(a->buffer) && ggml_is_quantized(a->type) && a->type == b->type &&
+           ggml_is_matrix(a) && ggml_is_matrix(b) && ggml_is_contiguous(a) && ggml_is_contiguous(b) &&
+           a->ne[0] == b->ne[0] && (const char *) a->data + ggml_nbytes(a) == b->data;
+}
+
+// three mat-vecs on the same src1 over adjacent weights (e.g. separate Q/K/V), run as one MMVQ
+static bool ggml_cuda_match_split_mul_mat(const ggml_cgraph * graph, int i) {
+    if (i + 2 >= graph->n_nodes) {
+        return false;
+    }
+    const ggml_tensor * mm[3] = { graph->nodes[i], graph->nodes[i + 1], graph->nodes[i + 2] };
+    for (const ggml_tensor * t : mm) {
+        if (t->op != GGML_OP_MUL_MAT || t->src[1] != mm[0]->src[1] || t->type != GGML_TYPE_F32 ||
+                !ggml_is_contiguous(t) || t->ne[1] != 1 || !ggml_cuda_should_fuse_mul_mat_vec_q(t)) {
+            return false;
+        }
+    }
+    return ggml_is_contiguous(mm[0]->src[1]) &&
+           ggml_cuda_weights_adjacent(mm[0]->src[0], mm[1]->src[0]) && ggml_cuda_weights_adjacent(mm[1]->src[0], mm[2]->src[0]);
+}
+
 static bool ggml_cuda_match_shared_expert(const ggml_cgraph * graph, int routed_idx, int shared_idx) {
     if (routed_idx + 2 >= graph->n_nodes || shared_idx + 2 >= graph->n_nodes || shared_idx < routed_idx + 3) {
         return false;
@@ -3960,6 +3984,30 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     ggml_tensor * node = cgraph->nodes[i];
 
+    if (node->op == GGML_OP_MUL_MAT && ggml_cuda_match_split_mul_mat(cgraph, i)) {
+        ggml_tensor * mm[3] = { node, cgraph->nodes[i + 1], cgraph->nodes[i + 2] };
+        const int64_t nrows = mm[0]->ne[0] + mm[1]->ne[0] + mm[2]->ne[0];
+
+        ggml_tensor weight = *mm[0]->src[0];
+        weight.ne[1] = nrows;
+        weight.nb[2] = weight.nb[1] * nrows;
+        weight.nb[3] = weight.nb[2];
+
+        ggml_tensor dst = *mm[0];
+        dst.ne[0] = nrows;
+        dst.nb[1] = dst.nb[0] * nrows;
+        dst.nb[2] = dst.nb[1];
+        dst.nb[3] = dst.nb[2];
+
+        ggml_cuda_mm_fusion_args_host fusion{};
+        fusion.split_dst[0] = mm[1];
+        fusion.split_dst[1] = mm[2];
+        fusion.split_row[0] = mm[0]->ne[0];
+        fusion.split_row[1] = mm[0]->ne[0] + mm[1]->ne[0];
+        ggml_cuda_mul_mat_vec_q(*cuda_ctx, &weight, mm[0]->src[1], nullptr, &dst, &fusion);
+        return 2;
+    }
+
     if (node->op == GGML_OP_MUL_MAT_ID && cuda_ctx->stream_context().concurrent_events.empty() &&
             ggml_cuda_match_shared_expert(cgraph, i, i + 3) &&
             ggml_cuda_should_fuse_mul_mat_vec_q(cgraph->nodes[i + 2]->src[1])) {
@@ -5125,6 +5173,47 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
         // add alloc deps for performance positive fusions. This may increase the overall compute buffer size.
         // TODO: consolidate fusion paths in graph_optimize and graph_compute
         ggml_cuda_set_device(cuda_ctx->device);
+
+        // Move mat-muls on the same src1 over adjacent weights (separate Q/K/V) next to each other for ggml_cuda_match_split_mul_mat.
+        // Only weights and src1 are checked, so the order does not depend on the batch size.
+        for (int i = 0; i + 2 < cgraph->n_nodes; ++i) {
+            const ggml_tensor * a = cgraph->nodes[i];
+            if (a->op != GGML_OP_MUL_MAT) {
+                continue;
+            }
+            // the graph order of the other two may differ from their memory order (e.g. Q, V, K)
+            const int end = std::min(cgraph->n_nodes, i + 17);
+            int found[2] = { -1, -1 };
+            for (int n_found = 0; n_found < 2; ++n_found) {
+                const ggml_tensor * prev = n_found == 0 ? a : cgraph->nodes[found[0]];
+                for (int j = i + 1; j < end; ++j) {
+                    const ggml_tensor * b = cgraph->nodes[j];
+                    if (b->op == GGML_OP_MUL_MAT && b->src[1] == a->src[1] && ggml_cuda_weights_adjacent(prev->src[0], b->src[0])) {
+                        found[n_found] = j;
+                        break;
+                    }
+                }
+                if (found[n_found] < 0) {
+                    break;
+                }
+            }
+            if (found[1] >= 0) {
+                // both only depend on weights and src1, so they can move up to right after a
+                ggml_tensor * b = cgraph->nodes[found[0]];
+                ggml_tensor * c = cgraph->nodes[found[1]];
+                const int last = std::max(found[0], found[1]);
+                int dst = last;
+                for (int j = last; j > i; --j) {
+                    if (cgraph->nodes[j] != b && cgraph->nodes[j] != c) {
+                        cgraph->nodes[dst--] = cgraph->nodes[j];
+                    }
+                }
+                cgraph->nodes[i + 1] = b;
+                cgraph->nodes[i + 2] = c;
+                i += 2;
+            }
+        }
+
         for (int i = 0; i + 5 < cgraph->n_nodes; ++i) {
             if (cgraph->nodes[i]->op != GGML_OP_MUL_MAT_ID) {
                 continue;

@@ -6666,6 +6666,53 @@ struct test_pool1d : public test_case {
     }
 };
 
+// separate Q/K/V projections of one input, run as one mat-vec on CUDA when the weights are adjacent
+struct test_mul_mat_split : public test_case {
+    const ggml_type type;
+    const int64_t k;
+    const std::array<int64_t, 3> m;
+    const int64_t n;
+
+    std::string vars() override {
+        return VARS_TO_STR4(type, k, m, n);
+    }
+
+    test_mul_mat_split(ggml_type type = GGML_TYPE_Q8_0, int64_t k = 256, std::array<int64_t, 3> m = {256, 64, 64}, int64_t n = 1)
+        : type(type), k(k), m(m), n(n) {}
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_SPLIT";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        // no sentinels in between, so the weights are adjacent in the backend buffer as in a model
+        // (unless the backend pads the rows, then the unfused path is tested)
+        ggml_tensor * wq = ::ggml_new_tensor_2d(ctx, type, k, m[0]);
+        ggml_tensor * wk = ::ggml_new_tensor_2d(ctx, type, k, m[1]);
+        ggml_tensor * wv = ::ggml_new_tensor_2d(ctx, type, k, m[2]);
+        add_sentinel(ctx);
+        ggml_tensor * x  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_set_name(x, "x");
+
+        ggml_tensor * q = ggml_mul_mat(ctx, wq, x);
+        ggml_tensor * kk = ggml_mul_mat(ctx, wk, x);
+        ggml_tensor * v = ggml_mul_mat(ctx, wv, x);
+
+        // q, k and v end up next to each other in the graph
+        ggml_tensor * out = ggml_concat(ctx, q, ggml_concat(ctx, kk, v, 0), 0);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
 // MoE down-projection amax rescaling (build_amax_src1_f16), fused on CUDA
 struct test_pool1d_amax : public test_case {
     const std::array<int64_t, 4> ne;
@@ -6681,6 +6728,8 @@ struct test_pool1d_amax : public test_case {
         GGML_UNUSED(t);
         return "POOL_1D_AMAX";
     }
+
+    bool run_whole_graph() override { return true; }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
@@ -10371,6 +10420,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     for (int64_t n_tokens : { 1, 7, 512 }) {
         test_cases.emplace_back(new test_pool1d_amax({ 512, 6, n_tokens, 1 }));
+    }
+
+    for (ggml_type type : { GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_IQ4_XS }) {
+        for (int64_t n : { 1, 2 }) {
+            test_cases.emplace_back(new test_mul_mat_split(type, 256, { 256, 64, 64 }, n));
+            test_cases.emplace_back(new test_mul_mat_split(type, 512, { 128, 32, 96 }, n));
+        }
     }
     test_cases.emplace_back(new test_pool1d_amax({ 2048, 8, 3, 1 }));
 

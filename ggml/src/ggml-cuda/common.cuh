@@ -1583,6 +1583,9 @@ struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * shared_up = nullptr;
     const ggml_tensor * shared_gate = nullptr;
     ggml_tensor * shared_dst = nullptr;
+    // mat-vec over adjacent weights (e.g. Q/K/V): rows from split_row[k] on go to split_dst[k]
+    ggml_tensor * split_dst[2] = { nullptr, nullptr };
+    int64_t split_row[2] = { 0, 0 };
 };
 struct ggml_cuda_mm_fusion_args_device {
     const void * x_bias = nullptr;
@@ -1596,6 +1599,10 @@ struct ggml_cuda_mm_fusion_args_device {
     const void * shared_gate = nullptr;
     float * shared_dst = nullptr;
     uint32_t shared_stride_col_dst = 0;
+    float * split_dst1 = nullptr;
+    float * split_dst2 = nullptr;
+    uint32_t split_row1 = 0;
+    uint32_t split_row2 = 0;
 };
 
 struct ggml_cuda_kernel_launch_params {
