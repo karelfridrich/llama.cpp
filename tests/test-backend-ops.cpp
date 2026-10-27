@@ -6666,6 +6666,50 @@ struct test_pool1d : public test_case {
     }
 };
 
+// MoE down-projection amax rescaling (build_amax_src1_f16), fused on CUDA
+struct test_pool1d_amax : public test_case {
+    const std::array<int64_t, 4> ne;
+
+    std::string vars() override {
+        return VARS_TO_STR1(ne);
+    }
+
+    test_pool1d_amax(std::array<int64_t, 4> ne = {512, 6, 1, 1})
+        : ne(ne) {}
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "POOL_1D_AMAX";
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_set_name(a, "a");
+
+        ggml_tensor * e = ggml_abs(ctx, a);
+        e = ggml_pool_1d(ctx, e, GGML_OP_POOL_MAX, ne[0], ne[0], 0);
+        e = ggml_scale(ctx, e, 1.0f/1024.0f);
+        e = ggml_log(ctx, e);
+        e = ggml_scale(ctx, e, 1.4426950408889634f);
+        e = ggml_ceil(ctx, e);
+        e = ggml_clamp(ctx, e, 0.0f, 127.0f);
+        e = ggml_scale(ctx, e, 0.6931471805599453f);
+        e = ggml_exp(ctx, e);
+
+        ggml_tensor * out = ggml_div(ctx, a, e);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            // large enough that the power-of-two scale is not always 1
+            init_tensor_uniform(t, -1e6f, 1e6f);
+        }
+    }
+};
+
 // GGML_OP_CONV_TRANSPOSE_1D
 struct test_conv_transpose_1d : public test_case {
     const std::array<int64_t, 4> ne_input;
@@ -10319,8 +10363,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                     }
                 }
             }
+            // long windows
+            test_cases.emplace_back(new test_pool1d(pool_type, type_input, { 512, 6, 1, 1 }, 512, 512, 0));
+            test_cases.emplace_back(new test_pool1d(pool_type, type_input, { 1000, 3, 2, 1 }, 100, 37, 5));
+            test_cases.emplace_back(new test_pool1d(pool_type, type_input, { 70, 4, 1, 1 }, 33, 20, 10));
         }
     }
+    for (int64_t n_tokens : { 1, 7, 512 }) {
+        test_cases.emplace_back(new test_pool1d_amax({ 512, 6, n_tokens, 1 }));
+    }
+    test_cases.emplace_back(new test_pool1d_amax({ 2048, 8, 3, 1 }));
 
 #if 0
     // >4GB im2col destination. Too slow to run by default.
