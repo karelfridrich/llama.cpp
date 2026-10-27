@@ -5147,12 +5147,14 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
         }
         for (int i = 0; i < cgraph->n_nodes; ++i) {
             // Keep the inputs of the fused gate/up/GLU MMQ kernel alive until the GLU so that they cannot alias its output (under op offload the weights are buffer copies).
+            // The MMVQ/MMVF fusion needs the same, otherwise it is skipped when the shared input is freed early (e.g. shared experts without Turing MMA).
             if (i + 2 < cgraph->n_nodes && cgraph->nodes[i + 2]->op == GGML_OP_GLU) {
                 ggml_tensor * glu  = cgraph->nodes[i + 2];
                 ggml_tensor * gate = glu->src[0];
                 ggml_tensor * up   = glu->src[1];
                 const bool ok = (gate == cgraph->nodes[i] && up == cgraph->nodes[i + 1]) || (gate == cgraph->nodes[i + 1] && up == cgraph->nodes[i]);
-                if (ok && ggml_cuda_mul_mat_q_fusion_matches(up, gate, glu, cuda_ctx->device)) {
+                if (ok && (ggml_cuda_mul_mat_q_fusion_matches(up, gate, glu, cuda_ctx->device) ||
+                           ggml_cuda_should_fuse_mul_mat(up, gate, glu))) {
                     add_alloc_deps(i, i + 2);
                     i += 2;
                     continue;
