@@ -5874,9 +5874,13 @@ struct test_mul_mat_id_shared : public test_case {
     ggml_tensor * routed = nullptr;
     ggml_tensor * shared = nullptr;
 
-    test_mul_mat_id_shared(ggml_type type, int64_t n) : type(type), n(n) {}
+    const ggml_type type_shared;
+    const int64_t m_shared;
 
-    std::string vars() override { return VARS_TO_STR2(type, n); }
+    test_mul_mat_id_shared(ggml_type type, int64_t n, ggml_type type_shared = GGML_TYPE_COUNT, int64_t m_shared = 128)
+        : type(type), n(n), type_shared(type_shared == GGML_TYPE_COUNT ? type : type_shared), m_shared(m_shared) {}
+
+    std::string vars() override { return VARS_TO_STR4(type, n, type_shared, m_shared); }
     std::string op_desc(ggml_tensor *) override { return "MUL_MAT_ID_SHARED"; }
     bool run_whole_graph() override { return true; }
     double max_nmse_err() override { return 5e-4; }
@@ -5889,11 +5893,11 @@ struct test_mul_mat_id_shared : public test_case {
         ggml_set_name(ids, "ids");
         ggml_tensor * up = ggml_new_tensor_3d(ctx, type, 512, 128, 8);
         ggml_tensor * gate = ggml_new_tensor_3d(ctx, type, 512, 128, 8);
-        ggml_tensor * shared_up = ggml_new_tensor_2d(ctx, type, 512, 128);
-        ggml_tensor * shared_gate = ggml_new_tensor_2d(ctx, type, 512, 128);
+        ggml_tensor * shared_up = ggml_new_tensor_2d(ctx, type_shared, 512, m_shared);
+        ggml_tensor * shared_gate = ggml_new_tensor_2d(ctx, type_shared, 512, m_shared);
         routed = ggml_swiglu_split(ctx, ggml_mul_mat_id(ctx, gate, input_ids, ids), ggml_mul_mat_id(ctx, up, input_ids, ids));
         shared = ggml_swiglu_split(ctx, ggml_mul_mat(ctx, shared_gate, input), ggml_mul_mat(ctx, shared_up, input));
-        return ggml_add(ctx, routed, ggml_reshape_3d(ctx, shared, 128, 1, n));
+        return ggml_add(ctx, routed, ggml_view_3d(ctx, shared, 128, 1, n, shared->nb[1], shared->nb[1], 0));
     }
 
     void initialize_tensors(ggml_context * ctx) override {
@@ -11637,6 +11641,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat_id_shared(type, n));
         }
     }
+    // shared expert with its own type or size (e.g. Flint): not one kernel, but one quantized input
+    for (int64_t n : { 1, 2, 9 }) {
+        test_cases.emplace_back(new test_mul_mat_id_shared(GGML_TYPE_Q4_K, n, GGML_TYPE_Q4_K, 256));
+        test_cases.emplace_back(new test_mul_mat_id_shared(GGML_TYPE_IQ4_XS, n, GGML_TYPE_Q8_0, 256));
+        test_cases.emplace_back(new test_mul_mat_id_shared(GGML_TYPE_Q5_K, n, GGML_TYPE_Q8_0, 128));
+    }
 
     // gpt-oss issue with Vulkan mmq_id
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_MXFP4, GGML_TYPE_F32, 32, 2, false, 2880, 32, 2880));
@@ -13009,7 +13019,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, GGML_TYPE_F32, 256, 6, false, 512, 1, 2048, 1));
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 256, 6, false, 2048, 1, 512));
     }
-    for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{{4096, 2048}, {2048, 4096}, {512, 2048}, {1024, 2048}, {2048, 1024}}) {
+    for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{{4096, 2048}, {5120, 2048}, {2048, 4096}, {512, 2048}, {1024, 2048}, {2048, 1024}}) {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, m, 1, k, {1, 1}, {1, 1}));
     }
     for (int K : {3, 5}) {
