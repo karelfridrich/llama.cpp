@@ -39,7 +39,7 @@ and [docs/](docs/).
 
 ## Status
 
-- Based on upstream `6050b46` (October 2026); rebased now and then.
+- Based on upstream `418f905` (October 2026); rebased now and then.
 - Tested with `test-backend-ops` and perplexity/KL-divergence checks against the CPU backend, on the two GPUs above
   only. Other GPUs get the same code paths in principle, but some changes are deliberately limited to Volta or RDNA2.
 - Not submitted upstream. Findings may be reported there as issues.
