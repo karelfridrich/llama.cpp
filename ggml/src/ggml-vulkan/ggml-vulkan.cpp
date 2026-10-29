@@ -6695,6 +6695,12 @@ static bool ggml_vk_should_use_mmvq(const vk_device& device, uint32_t m, uint32_
             return false;
         }
 
+        // RDNA2, one column: the fp path is faster for these on narrow matrices, MMVQ on wider ones
+        if (device->architecture == vk_device_architecture::AMD_RDNA2 && k <= 4096 &&
+            (src0_type == GGML_TYPE_Q4_0 || src0_type == GGML_TYPE_Q4_K || src0_type == GGML_TYPE_Q5_K)) {
+            return false;
+        }
+
         switch (src0_type) {
         case GGML_TYPE_Q8_0:
             return device->architecture == vk_device_architecture::AMD_GCN;
