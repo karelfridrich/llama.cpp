@@ -1075,6 +1075,7 @@ void process_shaders() {
     string_to_spv("cross_entropy_loss_f32", "cross_entropy_loss.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
     string_to_spv("cross_entropy_loss_back_f32", "cross_entropy_loss_back.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
     string_to_spv("fwht_f32", "fwht.comp", {{"A_TYPE", "float"}});
+    string_to_spv("fwht_signed_f32", "fwht.comp", {{"A_TYPE", "float"}, {"FWHT_SIGNED", "1"}});
     string_to_spv("fwht_shmem_f32", "fwht.comp", {{"A_TYPE", "float"}, {"FWHT_SHMEM", "1"}});
     string_to_spv("fwht_f16", "fwht.comp", {{"A_TYPE", "float16_t"}});
     string_to_spv("fwht_shmem_f16", "fwht.comp", {{"A_TYPE", "float16_t"}, {"FWHT_SHMEM", "1"}});
