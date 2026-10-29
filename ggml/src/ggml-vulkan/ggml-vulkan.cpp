@@ -3742,7 +3742,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
             for (uint32_t kda = 0; kda < 2; kda++) {
                 ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net[si][kda],
-                    gdn_names[si][kda], gdn_len, gdn_data, "main", 7, sizeof(vk_op_gated_delta_net_push_constants),
+                    gdn_names[si][kda], gdn_len, gdn_data, "main", 8, sizeof(vk_op_gated_delta_net_push_constants),
                     wg_denoms, {S_V, kda, gdn_subgroup_size, lanes_per_column}, 1, true, use_subgroup_ops, gdn_subgroup_size);
             }
         }
@@ -10373,7 +10373,68 @@ void ggml_vk_lightning_indexer(ggml_backend_vk_context * ctx, vk_context& subctx
         pc, {n_tiles_kv, n_tiles_t, n_streams});
 }
 
-void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+// GATED_DELTA_NET followed (after views only) by the CPY that stores its new state, all snapshot slots it writes,
+// into the recurrent cache: the delta net writes them there directly and the copy is skipped. Returns the CPY's
+// distance from the delta net, 0 when it can't fuse. check_uses is false in graph_optimize, before use counts exist.
+static int ggml_vk_gdn_store_distance(const struct ggml_cgraph * cgraph, int node_idx, bool check_uses = true) {
+    const ggml_tensor * gdn = cgraph->nodes[node_idx];
+    if (gdn->op != GGML_OP_GATED_DELTA_NET || gdn->type != GGML_TYPE_F32 || (gdn->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return 0;
+    }
+
+    int dist = 0;
+    for (int j = node_idx + 1; j < cgraph->n_nodes && j <= node_idx + 4; ++j) {
+        const ggml_op op = cgraph->nodes[j]->op;
+        if (op == GGML_OP_CPY) {
+            dist = j - node_idx;
+            break;
+        }
+        if (op != GGML_OP_VIEW && op != GGML_OP_RESHAPE && op != GGML_OP_NONE) {
+            return 0;
+        }
+    }
+    if (dist == 0) {
+        return 0;
+    }
+
+    const ggml_tensor * cpy   = cgraph->nodes[node_idx + dist];
+    const ggml_tensor * state = cpy->src[0]; // view of the state tail of the delta net output
+    const ggml_tensor * cache = cpy->src[1]; // the cache view it is copied to
+    if (state->op != GGML_OP_VIEW || state->view_src != gdn || cache->op != GGML_OP_VIEW ||
+        (state->flags & GGML_TENSOR_FLAG_OUTPUT) || (cpy->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+        gdn->type != GGML_TYPE_F32 || cpy->type != GGML_TYPE_F32 || cache->type != GGML_TYPE_F32) {
+        return 0;
+    }
+
+    // the shader leaves the state tail of dst unwritten, so nothing but the CPY may read it
+    if (check_uses) {
+        int state_idx = -1;
+        for (int j = node_idx + 1; j < node_idx + dist; ++j) {
+            if (cgraph->nodes[j] == state) {
+                state_idx = j;
+            }
+        }
+        if (state_idx < 0 || ggml_node_get_use_count(cgraph, state_idx) != 1) {
+            return 0;
+        }
+    }
+
+    // any shape works as long as it is the contiguous tail: slot, then seq, then the [S_v, S_v, H] state
+    const ggml_tensor * v = gdn->src[2];
+    const int64_t S_v = v->ne[0], H = v->ne[1], n_tokens = v->ne[2], n_seqs = v->ne[3];
+    const int64_t K = ggml_get_op_params_i32(gdn, 0);
+    const int64_t D = S_v * S_v * H;
+    const int64_t n_slots = std::min(n_tokens, K);
+    const size_t f = sizeof(float);
+    const bool state_ok = state->view_offs == (size_t)(S_v * H * n_tokens * n_seqs) * f && ggml_is_contiguous(state) &&
+        ggml_nelements(state) == D * n_seqs * n_slots;
+    const bool cache_ok = cpy->ne[0] == D && cpy->ne[1] == n_seqs && cpy->ne[2] == n_slots && cpy->ne[3] == 1 && cpy->nb[0] == f &&
+        cpy->nb[1] % f == 0 && cpy->nb[2] % f == 0;
+    return state_ok && cache_ok ? dist : 0;
+}
+
+void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    ggml_tensor * dst = cgraph->nodes[node_idx];
     const ggml_tensor * src_q     = dst->src[0];
     const ggml_tensor * src_v     = dst->src[2];
     const ggml_tensor * src_beta  = dst->src[4];
@@ -10415,18 +10476,29 @@ void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, 
     const uint32_t rq3  = (uint32_t)(src_v->ne[3] / src_q->ne[3]);
 
     const float scale = 1.0f / sqrtf((float)S_v);
-    const vk_op_gated_delta_net_push_constants pc = {
+    vk_op_gated_delta_net_push_constants pc = {
         H, n_tokens, n_seqs, s_off,
         sq1, sq2, sq3,
         sv1, sv2, sv3,
         sb1, sb2, sb3,
         neq1, rq3,
         scale,
-        K
+        K,
+        0, 0, 0, 0,
     };
 
+    vk_subbuffer cache_buf = dst_buf;
+    if (ctx->fused_gdn_store) {
+        const ggml_tensor * cpy = cgraph->nodes[node_idx + ctx->num_additional_fused_ops];
+        cache_buf = ggml_vk_tensor_subbuffer(ctx, cpy, true);
+        pc.cache_mode = 1;
+        pc.c_off = (uint32_t)(get_misalign_bytes(ctx, cpy) / sizeof(float));
+        pc.c_nb1 = (uint32_t)(cpy->nb[1] / sizeof(float));
+        pc.c_nb2 = (uint32_t)(cpy->nb[2] / sizeof(float));
+    }
+
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
-        {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], dst_buf},
+        {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], dst_buf, cache_buf},
         pc, { H, n_seqs, S_v });
 }
 
@@ -12882,7 +12954,7 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
         break;
 
     case GGML_OP_GATED_DELTA_NET:
-        ggml_vk_gated_delta_net(ctx, compute_ctx, node);
+        ggml_vk_gated_delta_net(ctx, compute_ctx, cgraph, node_idx);
 
         break;
 
@@ -14517,6 +14589,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
 
         ctx->fused_topk_moe_mode = TOPK_MOE_COUNT;
         ctx->fused_topk_moe_scale = false;
+        ctx->fused_gdn_store = false;
         ctx->fused_topk_qsa = false;
         ctx->fused_hc_post_gate = false;
         ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
@@ -14527,6 +14600,12 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->num_additional_fused_ops = num_adds - 1;
                 fusion_string = "MULTI_ADD";
                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, true);
+            } else if (int dist = ggml_vk_gdn_store_distance(cgraph, i)) {
+                ctx->num_additional_fused_ops = dist;
+                ctx->fused_gdn_store = true;
+                ctx->fused_ops_write_mask |= 1 << 0; // the attention output stays in dst
+                fusion_string = "GATED_DELTA_NET_STORE";
+                std::fill_n(op_srcs_fused_elementwise, dist + 1, false);
             } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_ADD, GGML_OP_ADD })) {
                 ctx->num_additional_fused_ops = 2;
                 fusion_string = "MUL_MAT_ADD_ADD";
@@ -14739,6 +14818,10 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                         if (!src || src->op == GGML_OP_NONE) {
                             continue;
                         }
+                        // the fused state store's CPY: its destination operand is its output
+                        if (ctx->fused_gdn_store && k == ctx->num_additional_fused_ops && s == 1) {
+                            continue;
+                        }
                         if (ggml_vk_tensors_overlap(src, dst, op_srcs_fused_elementwise[k])) {
                             bool found = false;
                             for (int n = 0; n < k; ++n) {
@@ -14759,6 +14842,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_ops_write_mask = 1;
                 ctx->fused_topk_moe_mode = TOPK_MOE_COUNT;
                 ctx->fused_topk_moe_scale = false;
+                ctx->fused_gdn_store = false;
                 ctx->fused_topk_qsa = false;
                 ctx->fused_hc_post_gate = false;
                 ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
@@ -15017,6 +15101,20 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
         if (keep_pattern(rope_view_set_rows_pattern)) {
             continue;
         }
+        // the delta net and its state store stay together; views between them that are already placed stay put
+        if (int dist = ggml_vk_gdn_store_distance(graph, first_unused, false)) {
+            for (int j = first_unused; j <= first_unused + dist; ++j) {
+                if (!used[j]) {
+                    new_order.push_back(graph->nodes[j]);
+                    used_node_set.insert(graph->nodes[j]);
+                    used[j] = true;
+                }
+            }
+            while (first_unused < graph->n_nodes && used[first_unused]) {
+                first_unused++;
+            }
+            continue;
+        }
         if (match_pattern(hc_post_gate_pattern, first_unused)) {
             add_pattern_alloc_deps(hc_post_gate_pattern, first_unused + (int) hc_post_gate_pattern.size() - 1);
             keep_pattern(hc_post_gate_pattern);
@@ -15062,7 +15160,8 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 match_pattern(rms_norm_mul_rope_view_set_rows_pattern, j) ||
                 match_pattern(rms_norm_view_set_rows_pattern, j) ||
                 match_pattern(rope_view_set_rows_pattern, j) ||
-                match_pattern(hc_post_gate_pattern, j)) {
+                match_pattern(hc_post_gate_pattern, j) ||
+                ggml_vk_gdn_store_distance(graph, j, false)) {
                 continue;
             }
             bool ok = true;

@@ -1281,6 +1281,8 @@ struct ggml_backend_vk_context {
     int fused_ops_write_mask {};
     topk_moe_mode fused_topk_moe_mode {};
     bool fused_topk_moe_scale {};
+    // set when the current GATED_DELTA_NET also does the CPY of its new state into the recurrent cache
+    bool fused_gdn_store {};
     // QSA indexer gather+add+top_k fused into one radix-select
     bool fused_topk_qsa {};
     bool fused_hc_post_gate {};
