@@ -1,3 +1,6 @@
+> **This is branch `vulkan-iq-int8` of [karelfridrich/llama.cpp](https://github.com/karelfridrich/llama.cpp)**: int8 Vulkan kernels for IQ2/IQ3 quants.
+> What it changes and why: [FORK-vulkan-iq-int8.md](FORK-vulkan-iq-int8.md). The rest of this README is upstream's.
+
 # llama.cpp
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
