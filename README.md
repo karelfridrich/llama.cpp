@@ -1,3 +1,6 @@
+> **This is branch `vulkan-rdna2` of [karelfridrich/llama.cpp](https://github.com/karelfridrich/llama.cpp)**: Vulkan heuristics tuned for RDNA2 (RX 6800).
+> What it changes and why: [FORK-vulkan-rdna2.md](FORK-vulkan-rdna2.md). The rest of this README is upstream's.
+
 # llama.cpp
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
