@@ -1,3 +1,6 @@
+> **This is branch `prism-pq2` of [karelfridrich/llama.cpp](https://github.com/karelfridrich/llama.cpp)**: PrismML PQ2_0 (Bonsai) support.
+> What it changes and why: [FORK-prism-pq2.md](FORK-prism-pq2.md). The rest of this README is upstream's.
+
 # llama.cpp
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
