@@ -860,7 +860,18 @@ static __global__ void mul_mat_vec_q(
                         }
                     }
                 }
-                dst[j*stride_col_dst + i] = result;
+                float * out = dst + j*stride_col_dst + i;
+                if constexpr (has_fusion) {
+                    if (fusion.split_dst1) {
+                        const uint32_t row = row0 + i;
+                        if (row >= fusion.split_row2) {
+                            out = fusion.split_dst2 + (row - fusion.split_row2);
+                        } else if (row >= fusion.split_row1) {
+                            out = fusion.split_dst1 + (row - fusion.split_row1);
+                        }
+                    }
+                }
+                *out = result;
             }
         }
     }
@@ -1054,7 +1065,7 @@ static void mul_mat_vec_q_switch_fusion(
         const uint32_t ids_stride, cudaStream_t stream) {
 
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
-                            fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
+                            fusion.x_scale != nullptr || fusion.gate_scale != nullptr || fusion.split_dst1 != nullptr;
     if constexpr (c_ncols_dst == 1) {
         if (has_fusion) {
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
@@ -1159,15 +1170,20 @@ static void mul_mat_vec_q_switch_ncols_dst(
             GGML_TYPE_Q3_K,
         };
 
+        const bool is_nvidia_volta        = GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_VOLTA && cc < GGML_CUDA_CC_TURING;
         const bool is_nvidia_turing_plus  = GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_TURING;
         const bool is_nvidia_pascal_older = GGML_CUDA_CC_IS_NVIDIA(cc) && cc < GGML_CUDA_CC_VOLTA;
+
+        // Volta: the slow IQ types still gain when most of the block would idle (MoE down projections with K = 512),
+        // with half the block busy the fewer blocks cost more DRAM parallelism than they save
+        const bool volta_mostly_idle = is_nvidia_volta && 2 * blocks_per_row_x < nwarps * blocks_per_iter_1warp;
 
         if (is_nvidia_turing_plus) {
             if (ncols_dst == 1 &&
                     std::find(iq_slow_turing.begin(), iq_slow_turing.end(), type) != iq_slow_turing.end()) {
                 use = false;
             }
-        } else if ((ncols_dst == 1 && std::find(iq_slow_other.begin(), iq_slow_other.end(), type) != iq_slow_other.end()) ||
+        } else if ((!volta_mostly_idle && ncols_dst == 1 && std::find(iq_slow_other.begin(), iq_slow_other.end(), type) != iq_slow_other.end()) ||
                 (is_nvidia_pascal_older && std::find(slow_pascal.begin(), slow_pascal.end(), type) != slow_pascal.end()) ||
                 GGML_CUDA_CC_IS_RDNA(cc)) {
             use = false;
@@ -1454,7 +1470,7 @@ static void mul_mat_vec_q_switch_type(
 
 void ggml_cuda_mul_mat_vec_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
-        const ggml_cuda_mm_fusion_args_host * fusion) {
+        const ggml_cuda_mm_fusion_args_host * fusion, const void * src1_q8_1_pre) {
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
     GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
@@ -1474,7 +1490,6 @@ void ggml_cuda_mul_mat_vec_q(
 
     GGML_ASSERT(!ids || ne12 <= MMVQ_MAX_BATCH_SIZE);
 
-    const float   * src1_d =       (const float   *) src1->data;
     const int32_t *  ids_d = ids ? (const int32_t *)  ids->data : nullptr;
     float         *  dst_d =       (float         *)  dst->data;
 
@@ -1515,6 +1530,14 @@ void ggml_cuda_mul_mat_vec_q(
             GGML_ASSERT(fusion->gate->type == src0->type && ggml_are_same_stride(fusion->gate, src0));
             fusion_local.gate = fusion->gate->data;
         }
+        if (fusion->split_dst[0]) {
+            GGML_ASSERT(!ids && dst->ne[1] == 1 && fusion->split_dst[1]);
+            GGML_ASSERT(0 < fusion->split_row[0] && fusion->split_row[0] < fusion->split_row[1] && fusion->split_row[1] < dst->ne[0]);
+            fusion_local.split_dst1 = (float *) fusion->split_dst[0]->data;
+            fusion_local.split_dst2 = (float *) fusion->split_dst[1]->data;
+            fusion_local.split_row1 = fusion->split_row[0];
+            fusion_local.split_row2 = fusion->split_row[1];
+        }
         if (fusion->gate_bias) {
             GGML_ASSERT(fusion->gate_bias->type == GGML_TYPE_F32);
             GGML_ASSERT(fusion->gate_bias->ne[0] == dst->ne[0]);
@@ -1549,13 +1572,11 @@ void ggml_cuda_mul_mat_vec_q(
     }
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
-    {
-        const int64_t s11 = src1->nb[1] / ts_src1;
-        const int64_t s12 = src1->nb[2] / ts_src1;
-        const int64_t s13 = src1->nb[3] / ts_src1;
-        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool());
+    if (!src1_q8_1_pre) {
+        ggml_cuda_mmvq_quantize_src1(src0, src1, src1_q8_1.alloc(ggml_cuda_mmvq_src1_size(src1)), stream);
     }
+    const void * src1_q = src1_q8_1_pre ? src1_q8_1_pre : src1_q8_1.get();
 
     const int64_t s01 = src0->nb[1] / ts_src0;
     const int64_t s11 = ne10_padded / QK8_1;
@@ -1580,10 +1601,21 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
 
     mul_mat_vec_q_switch_type(
-        src0->data, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
+        src0->data, src0->type, src1_q, ids_d, fusion_local, dst_d, ne00,
         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
         ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);
+}
+
+size_t ggml_cuda_mmvq_src1_size(const ggml_tensor * src1) {
+    return ggml_nrows(src1) * GGML_PAD(src1->ne[0], MATRIX_ROW_PADDING) * sizeof(block_q8_1)/QK8_1;
+}
+
+void ggml_cuda_mmvq_quantize_src1(const ggml_tensor * src0, const ggml_tensor * src1, void * dst, cudaStream_t stream) {
+    const size_t ts_src1 = ggml_type_size(src1->type);
+    quantize_row_q8_1_cuda((const float *) src1->data, nullptr, dst, src0->type, src1->ne[0],
+        src1->nb[1] / ts_src1, src1->nb[2] / ts_src1, src1->nb[3] / ts_src1,
+        GGML_PAD(src1->ne[0], MATRIX_ROW_PADDING), src1->ne[1], src1->ne[2], src1->ne[3], stream);
 }
 
 void ggml_cuda_op_mul_mat_vec_q(

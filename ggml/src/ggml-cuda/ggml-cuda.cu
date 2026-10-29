@@ -1996,7 +1996,32 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     return use_mul_mat_vec_q;
 }
 
-static bool ggml_cuda_match_shared_expert(const ggml_cgraph * graph, int routed_idx, int shared_idx) {
+// b starts right after a in device memory with the same row layout, so both can be read as one weight matrix
+static bool ggml_cuda_weights_adjacent(const ggml_tensor * a, const ggml_tensor * b) {
+    return a->op == GGML_OP_NONE && b->op == GGML_OP_NONE && a->buffer && a->buffer == b->buffer &&
+           ggml_backend_buffer_is_cuda(a->buffer) && ggml_is_quantized(a->type) && a->type == b->type &&
+           ggml_is_matrix(a) && ggml_is_matrix(b) && ggml_is_contiguous(a) && ggml_is_contiguous(b) &&
+           a->ne[0] == b->ne[0] && (const char *) a->data + ggml_nbytes(a) == b->data;
+}
+
+// three mat-vecs on the same src1 over adjacent weights (e.g. separate Q/K/V), run as one MMVQ
+static bool ggml_cuda_match_split_mul_mat(const ggml_cgraph * graph, int i) {
+    if (i + 2 >= graph->n_nodes) {
+        return false;
+    }
+    const ggml_tensor * mm[3] = { graph->nodes[i], graph->nodes[i + 1], graph->nodes[i + 2] };
+    for (const ggml_tensor * t : mm) {
+        if (t->op != GGML_OP_MUL_MAT || t->src[1] != mm[0]->src[1] || t->type != GGML_TYPE_F32 ||
+                !ggml_is_contiguous(t) || t->ne[1] != 1 || !ggml_cuda_should_fuse_mul_mat_vec_q(t)) {
+            return false;
+        }
+    }
+    return ggml_is_contiguous(mm[0]->src[1]) &&
+           ggml_cuda_weights_adjacent(mm[0]->src[0], mm[1]->src[0]) && ggml_cuda_weights_adjacent(mm[1]->src[0], mm[2]->src[0]);
+}
+
+// routed gate/up/GLU at routed_idx and the shared expert's gate/up/GLU at shared_idx over the same single-token input
+static bool ggml_cuda_match_shared_input(const ggml_cgraph * graph, int routed_idx, int shared_idx) {
     if (routed_idx + 2 >= graph->n_nodes || shared_idx + 2 >= graph->n_nodes || shared_idx < routed_idx + 3) {
         return false;
     }
@@ -2024,28 +2049,33 @@ static bool ggml_cuda_match_shared_expert(const ggml_cgraph * graph, int routed_
     if (!is_pair(gate, up, routed_idx) || !is_pair(shared_gate, shared_up, shared_idx) ||
             !ggml_cuda_should_fuse_mul_mat(up, gate, routed) ||
             !ggml_cuda_should_fuse_mul_mat(shared_up, shared_gate, shared) ||
-            !up->src[0]->buffer ||
-            !ggml_is_quantized(up->src[0]->type)) {
+            !up->src[0]->buffer || !ggml_is_quantized(up->src[0]->type) ||
+            !shared_up->src[0]->buffer || !ggml_is_quantized(shared_up->src[0]->type)) {
         return false;
     }
     const ggml_tensor * input = up->src[1];
-    const ggml_tensor * weight = up->src[0];
-    const ggml_tensor * shared_weight = shared_up->src[0];
-    if (input->op != GGML_OP_RESHAPE || input->src[0] != shared_up->src[1] ||
-            input->ne[1] != 1 || input->ne[3] != 1 || !ggml_is_contiguous(input) ||
-            !ggml_is_contiguous(shared_up->src[1]) || !ggml_is_matrix(shared_up->src[1]) ||
-            weight->type != shared_weight->type || weight->ne[0] != shared_weight->ne[0] ||
-            weight->ne[1] != shared_weight->ne[1] || weight->nb[1] != shared_weight->nb[1] || weight->ne[3] != 1 ||
-            !ggml_is_matrix(shared_weight) || !ggml_is_contiguous(shared_weight) ||
-            !ggml_is_contiguous(shared_gate->src[0]) || !ggml_is_contiguous(routed) || !ggml_is_contiguous(shared)) {
+    return input->op == GGML_OP_RESHAPE && input->src[0] == shared_up->src[1] &&
+           input->ne[1] == 1 && input->ne[3] == 1 && ggml_is_contiguous(input) &&
+           ggml_is_contiguous(shared_up->src[1]) && ggml_is_matrix(shared_up->src[1]) &&
+           ggml_is_contiguous(routed) && ggml_is_contiguous(shared);
+}
+
+// as ggml_cuda_match_shared_input, and the shared weights fit the routed kernel as one more expert
+static bool ggml_cuda_match_shared_expert(const ggml_cgraph * graph, int routed_idx, int shared_idx) {
+    if (!ggml_cuda_match_shared_input(graph, routed_idx, shared_idx)) {
         return false;
     }
-    if (shared_weight->op != GGML_OP_NONE || shared_gate->src[0]->op != GGML_OP_NONE ||
-            ggml_get_glu_op(routed) != ggml_get_glu_op(shared) ||
-            ggml_get_op_params_f32(routed, 3) != ggml_get_op_params_f32(shared, 3)) {
-        return false;
-    }
-    return true;
+    const ggml_tensor * routed = graph->nodes[routed_idx + 2];
+    const ggml_tensor * shared = graph->nodes[shared_idx + 2];
+    const ggml_tensor * weight = routed->src[1]->src[0];
+    const ggml_tensor * shared_weight = shared->src[1]->src[0];
+    const ggml_tensor * shared_gate_weight = shared->src[0]->src[0];
+    return weight->type == shared_weight->type && weight->ne[0] == shared_weight->ne[0] &&
+           weight->ne[1] == shared_weight->ne[1] && weight->nb[1] == shared_weight->nb[1] && weight->ne[3] == 1 &&
+           ggml_is_matrix(shared_weight) && ggml_is_contiguous(shared_weight) && ggml_is_contiguous(shared_gate_weight) &&
+           shared_weight->op == GGML_OP_NONE && shared_gate_weight->op == GGML_OP_NONE &&
+           ggml_get_glu_op(routed) == ggml_get_glu_op(shared) &&
+           ggml_get_op_params_f32(routed, 3) == ggml_get_op_params_f32(shared, 3);
 }
 
 // Buffer- and batch-size independent, so graph_optimize produces the same graph topology for every ubatch size (see #29986).
@@ -3694,6 +3724,18 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         }
     }
 
+    std::initializer_list<enum ggml_op> pool1d_amax_ops = { GGML_OP_UNARY, GGML_OP_POOL_1D, GGML_OP_SCALE, GGML_OP_LOG, GGML_OP_SCALE,
+                                                            GGML_OP_UNARY, GGML_OP_CLAMP, GGML_OP_SCALE, GGML_OP_UNARY };
+
+    if (is_equal(pool1d_amax_ops, ops) && ggml_can_fuse_subgraph(cgraph, node_idx, ops, { node_idx + 8 })) {
+        if (ggml_check_edges(cgraph, node_idx, {{1, 0, 0}, {2, 0, 1}, {3, 0, 2}, {4, 0, 3}, {5, 0, 4}, {6, 0, 5}, {7, 0, 6}, {8, 0, 7}}) &&
+            ggml_cuda_should_fuse_pool1d_amax(cgraph->nodes + node_idx)) {
+            int out_nodes[] = { node_idx + 8 };
+            return ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, (int)ops.size(), out_nodes, 1);
+        }
+        return false;
+    }
+
     std::initializer_list<enum ggml_op> rms_norm_mul_rope_ops          = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE };
     std::initializer_list<enum ggml_op> rms_norm_mul_rope_set_rows_ops = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS };
 
@@ -3948,22 +3990,61 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     ggml_tensor * node = cgraph->nodes[i];
 
+    if (node->op == GGML_OP_MUL_MAT && ggml_cuda_match_split_mul_mat(cgraph, i)) {
+        ggml_tensor * mm[3] = { node, cgraph->nodes[i + 1], cgraph->nodes[i + 2] };
+        const int64_t nrows = mm[0]->ne[0] + mm[1]->ne[0] + mm[2]->ne[0];
+
+        ggml_tensor weight = *mm[0]->src[0];
+        weight.ne[1] = nrows;
+        weight.nb[2] = weight.nb[1] * nrows;
+        weight.nb[3] = weight.nb[2];
+
+        ggml_tensor dst = *mm[0];
+        dst.ne[0] = nrows;
+        dst.nb[1] = dst.nb[0] * nrows;
+        dst.nb[2] = dst.nb[1];
+        dst.nb[3] = dst.nb[2];
+
+        ggml_cuda_mm_fusion_args_host fusion{};
+        fusion.split_dst[0] = mm[1];
+        fusion.split_dst[1] = mm[2];
+        fusion.split_row[0] = mm[0]->ne[0];
+        fusion.split_row[1] = mm[0]->ne[0] + mm[1]->ne[0];
+        ggml_cuda_mul_mat_vec_q(*cuda_ctx, &weight, mm[0]->src[1], nullptr, &dst, &fusion);
+        return 2;
+    }
+
     if (node->op == GGML_OP_MUL_MAT_ID && cuda_ctx->stream_context().concurrent_events.empty() &&
-            ggml_cuda_match_shared_expert(cgraph, i, i + 3) &&
-            ggml_cuda_should_fuse_mul_mat_vec_q(cgraph->nodes[i + 2]->src[1])) {
+            ggml_cuda_match_shared_input(cgraph, i, i + 3) &&
+            ggml_cuda_should_fuse_mul_mat_vec_q(cgraph->nodes[i + 2]->src[1]) &&
+            ggml_cuda_should_fuse_mul_mat_vec_q(cgraph->nodes[i + 5]->src[1])) {
         const int outputs[] = { i + 2, i + 5 };
         if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, 6, outputs, 2)) {
             ggml_tensor * routed = cgraph->nodes[i + 2];
             ggml_tensor * shared = cgraph->nodes[i + 5];
             const ggml_tensor * up = routed->src[1];
+            const ggml_tensor * shared_up = shared->src[1];
             ggml_cuda_mm_fusion_args_host fusion{};
             fusion.gate = routed->src[0]->src[0];
             fusion.glu_op = ggml_get_glu_op(routed);
             fusion.glu_limit = ggml_get_op_params_f32(routed, 3);
-            fusion.shared_up = shared->src[1]->src[0];
-            fusion.shared_gate = shared->src[0]->src[0];
-            fusion.shared_dst = shared;
-            ggml_cuda_mul_mat_vec_q(*cuda_ctx, up->src[0], up->src[1], up->src[2], routed, &fusion);
+            if (ggml_cuda_match_shared_expert(cgraph, i, i + 3)) {
+                fusion.shared_up = shared_up->src[0];
+                fusion.shared_gate = shared->src[0]->src[0];
+                fusion.shared_dst = shared;
+                ggml_cuda_mul_mat_vec_q(*cuda_ctx, up->src[0], up->src[1], up->src[2], routed, &fusion);
+                return 5;
+            }
+            // different shapes or types: two kernels, but the input is quantized once
+            ggml_cuda_pool_alloc<char> src1_q8_1(cuda_ctx->pool(), ggml_cuda_mmvq_src1_size(up->src[1]));
+            ggml_cuda_mmvq_quantize_src1(up->src[0], up->src[1], src1_q8_1.get(), cuda_ctx->stream());
+            ggml_cuda_mul_mat_vec_q(*cuda_ctx, up->src[0], up->src[1], up->src[2], routed, &fusion, src1_q8_1.get());
+
+            ggml_cuda_mm_fusion_args_host shared_fusion{};
+            shared_fusion.gate = shared->src[0]->src[0];
+            shared_fusion.glu_op = ggml_get_glu_op(shared);
+            shared_fusion.glu_limit = ggml_get_op_params_f32(shared, 3);
+            ggml_cuda_mul_mat_vec_q(*cuda_ctx, shared_up->src[0], shared_up->src[1], nullptr, shared, &shared_fusion, src1_q8_1.get());
             return 5;
         }
     }
@@ -4747,6 +4828,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 2;
     }
 
+    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_POOL_1D, GGML_OP_SCALE, GGML_OP_LOG, GGML_OP_SCALE,
+                                        GGML_OP_UNARY, GGML_OP_CLAMP, GGML_OP_SCALE, GGML_OP_UNARY },
+                           { GGML_UNARY_OP_ABS, GGML_UNARY_OP_CEIL, GGML_UNARY_OP_EXP })) {
+        ggml_cuda_op_pool1d_amax_fused(*cuda_ctx, cgraph->nodes + i);
+        return 8;
+    }
+
     return 0;
 }
 
@@ -5106,6 +5194,47 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
         // add alloc deps for performance positive fusions. This may increase the overall compute buffer size.
         // TODO: consolidate fusion paths in graph_optimize and graph_compute
         ggml_cuda_set_device(cuda_ctx->device);
+
+        // Move mat-muls on the same src1 over adjacent weights (separate Q/K/V) next to each other for ggml_cuda_match_split_mul_mat.
+        // Only weights and src1 are checked, so the order does not depend on the batch size.
+        for (int i = 0; i + 2 < cgraph->n_nodes; ++i) {
+            const ggml_tensor * a = cgraph->nodes[i];
+            if (a->op != GGML_OP_MUL_MAT) {
+                continue;
+            }
+            // the graph order of the other two may differ from their memory order (e.g. Q, V, K)
+            const int end = std::min(cgraph->n_nodes, i + 17);
+            int found[2] = { -1, -1 };
+            for (int n_found = 0; n_found < 2; ++n_found) {
+                const ggml_tensor * prev = n_found == 0 ? a : cgraph->nodes[found[0]];
+                for (int j = i + 1; j < end; ++j) {
+                    const ggml_tensor * b = cgraph->nodes[j];
+                    if (b->op == GGML_OP_MUL_MAT && b->src[1] == a->src[1] && ggml_cuda_weights_adjacent(prev->src[0], b->src[0])) {
+                        found[n_found] = j;
+                        break;
+                    }
+                }
+                if (found[n_found] < 0) {
+                    break;
+                }
+            }
+            if (found[1] >= 0) {
+                // both only depend on weights and src1, so they can move up to right after a
+                ggml_tensor * b = cgraph->nodes[found[0]];
+                ggml_tensor * c = cgraph->nodes[found[1]];
+                const int last = std::max(found[0], found[1]);
+                int dst = last;
+                for (int j = last; j > i; --j) {
+                    if (cgraph->nodes[j] != b && cgraph->nodes[j] != c) {
+                        cgraph->nodes[dst--] = cgraph->nodes[j];
+                    }
+                }
+                cgraph->nodes[i + 1] = b;
+                cgraph->nodes[i + 2] = c;
+                i += 2;
+            }
+        }
+
         for (int i = 0; i + 5 < cgraph->n_nodes; ++i) {
             if (cgraph->nodes[i]->op != GGML_OP_MUL_MAT_ID) {
                 continue;
@@ -5114,7 +5243,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 if (cgraph->nodes[j]->op == GGML_OP_MUL_MAT_ID && cgraph->nodes[j + 1]->op == GGML_OP_MUL_MAT_ID) {
                     break;
                 }
-                if (cgraph->nodes[j]->op != GGML_OP_MUL_MAT || !ggml_cuda_match_shared_expert(cgraph, i, j)) {
+                if (cgraph->nodes[j]->op != GGML_OP_MUL_MAT || !ggml_cuda_match_shared_input(cgraph, i, j)) {
                     continue;
                 }
                 // Group both outputs before allocation so the shared result cannot alias intervening nodes.
@@ -5128,12 +5257,14 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
         }
         for (int i = 0; i < cgraph->n_nodes; ++i) {
             // Keep the inputs of the fused gate/up/GLU MMQ kernel alive until the GLU so that they cannot alias its output (under op offload the weights are buffer copies).
+            // The MMVQ/MMVF fusion needs the same, otherwise it is skipped when the shared input is freed early (e.g. shared experts without Turing MMA).
             if (i + 2 < cgraph->n_nodes && cgraph->nodes[i + 2]->op == GGML_OP_GLU) {
                 ggml_tensor * glu  = cgraph->nodes[i + 2];
                 ggml_tensor * gate = glu->src[0];
                 ggml_tensor * up   = glu->src[1];
                 const bool ok = (gate == cgraph->nodes[i] && up == cgraph->nodes[i + 1]) || (gate == cgraph->nodes[i + 1] && up == cgraph->nodes[i]);
-                if (ok && ggml_cuda_mul_mat_q_fusion_matches(up, gate, glu, cuda_ctx->device)) {
+                if (ok && (ggml_cuda_mul_mat_q_fusion_matches(up, gate, glu, cuda_ctx->device) ||
+                           ggml_cuda_should_fuse_mul_mat(up, gate, glu))) {
                     add_alloc_deps(i, i + 2);
                     i += 2;
                     continue;

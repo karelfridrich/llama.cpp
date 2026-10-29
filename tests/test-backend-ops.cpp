@@ -5874,9 +5874,13 @@ struct test_mul_mat_id_shared : public test_case {
     ggml_tensor * routed = nullptr;
     ggml_tensor * shared = nullptr;
 
-    test_mul_mat_id_shared(ggml_type type, int64_t n) : type(type), n(n) {}
+    const ggml_type type_shared;
+    const int64_t m_shared;
 
-    std::string vars() override { return VARS_TO_STR2(type, n); }
+    test_mul_mat_id_shared(ggml_type type, int64_t n, ggml_type type_shared = GGML_TYPE_COUNT, int64_t m_shared = 128)
+        : type(type), n(n), type_shared(type_shared == GGML_TYPE_COUNT ? type : type_shared), m_shared(m_shared) {}
+
+    std::string vars() override { return VARS_TO_STR4(type, n, type_shared, m_shared); }
     std::string op_desc(ggml_tensor *) override { return "MUL_MAT_ID_SHARED"; }
     bool run_whole_graph() override { return true; }
     double max_nmse_err() override { return 5e-4; }
@@ -5889,11 +5893,11 @@ struct test_mul_mat_id_shared : public test_case {
         ggml_set_name(ids, "ids");
         ggml_tensor * up = ggml_new_tensor_3d(ctx, type, 512, 128, 8);
         ggml_tensor * gate = ggml_new_tensor_3d(ctx, type, 512, 128, 8);
-        ggml_tensor * shared_up = ggml_new_tensor_2d(ctx, type, 512, 128);
-        ggml_tensor * shared_gate = ggml_new_tensor_2d(ctx, type, 512, 128);
+        ggml_tensor * shared_up = ggml_new_tensor_2d(ctx, type_shared, 512, m_shared);
+        ggml_tensor * shared_gate = ggml_new_tensor_2d(ctx, type_shared, 512, m_shared);
         routed = ggml_swiglu_split(ctx, ggml_mul_mat_id(ctx, gate, input_ids, ids), ggml_mul_mat_id(ctx, up, input_ids, ids));
         shared = ggml_swiglu_split(ctx, ggml_mul_mat(ctx, shared_gate, input), ggml_mul_mat(ctx, shared_up, input));
-        return ggml_add(ctx, routed, ggml_reshape_3d(ctx, shared, 128, 1, n));
+        return ggml_add(ctx, routed, ggml_view_3d(ctx, shared, 128, 1, n, shared->nb[1], shared->nb[1], 0));
     }
 
     void initialize_tensors(ggml_context * ctx) override {
@@ -6663,6 +6667,99 @@ struct test_pool1d : public test_case {
         ggml_set_name(out, "out");
 
         return out;
+    }
+};
+
+// separate Q/K/V projections of one input, run as one mat-vec on CUDA when the weights are adjacent
+struct test_mul_mat_split : public test_case {
+    const ggml_type type;
+    const int64_t k;
+    const std::array<int64_t, 3> m;
+    const int64_t n;
+
+    std::string vars() override {
+        return VARS_TO_STR4(type, k, m, n);
+    }
+
+    test_mul_mat_split(ggml_type type = GGML_TYPE_Q8_0, int64_t k = 256, std::array<int64_t, 3> m = {256, 64, 64}, int64_t n = 1)
+        : type(type), k(k), m(m), n(n) {}
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_SPLIT";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        // no sentinels in between, so the weights are adjacent in the backend buffer as in a model
+        // (unless the backend pads the rows, then the unfused path is tested)
+        ggml_tensor * wq = ::ggml_new_tensor_2d(ctx, type, k, m[0]);
+        ggml_tensor * wk = ::ggml_new_tensor_2d(ctx, type, k, m[1]);
+        ggml_tensor * wv = ::ggml_new_tensor_2d(ctx, type, k, m[2]);
+        add_sentinel(ctx);
+        ggml_tensor * x  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_set_name(x, "x");
+
+        ggml_tensor * q = ggml_mul_mat(ctx, wq, x);
+        ggml_tensor * kk = ggml_mul_mat(ctx, wk, x);
+        ggml_tensor * v = ggml_mul_mat(ctx, wv, x);
+
+        // q, k and v end up next to each other in the graph
+        ggml_tensor * out = ggml_concat(ctx, q, ggml_concat(ctx, kk, v, 0), 0);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
+// MoE down-projection amax rescaling (build_amax_src1_f16), fused on CUDA
+struct test_pool1d_amax : public test_case {
+    const std::array<int64_t, 4> ne;
+
+    std::string vars() override {
+        return VARS_TO_STR1(ne);
+    }
+
+    test_pool1d_amax(std::array<int64_t, 4> ne = {512, 6, 1, 1})
+        : ne(ne) {}
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "POOL_1D_AMAX";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_set_name(a, "a");
+
+        ggml_tensor * e = ggml_abs(ctx, a);
+        e = ggml_pool_1d(ctx, e, GGML_OP_POOL_MAX, ne[0], ne[0], 0);
+        e = ggml_scale(ctx, e, 1.0f/1024.0f);
+        e = ggml_log(ctx, e);
+        e = ggml_scale(ctx, e, 1.4426950408889634f);
+        e = ggml_ceil(ctx, e);
+        e = ggml_clamp(ctx, e, 0.0f, 127.0f);
+        e = ggml_scale(ctx, e, 0.6931471805599453f);
+        e = ggml_exp(ctx, e);
+
+        ggml_tensor * out = ggml_div(ctx, a, e);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            // large enough that the power-of-two scale is not always 1
+            init_tensor_uniform(t, -1e6f, 1e6f);
+        }
     }
 };
 
@@ -10319,8 +10416,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                     }
                 }
             }
+            // long windows
+            test_cases.emplace_back(new test_pool1d(pool_type, type_input, { 512, 6, 1, 1 }, 512, 512, 0));
+            test_cases.emplace_back(new test_pool1d(pool_type, type_input, { 1000, 3, 2, 1 }, 100, 37, 5));
+            test_cases.emplace_back(new test_pool1d(pool_type, type_input, { 70, 4, 1, 1 }, 33, 20, 10));
         }
     }
+    for (int64_t n_tokens : { 1, 7, 512 }) {
+        test_cases.emplace_back(new test_pool1d_amax({ 512, 6, n_tokens, 1 }));
+    }
+
+    for (ggml_type type : { GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_IQ4_XS }) {
+        for (int64_t n : { 1, 2 }) {
+            test_cases.emplace_back(new test_mul_mat_split(type, 256, { 256, 64, 64 }, n));
+            test_cases.emplace_back(new test_mul_mat_split(type, 512, { 128, 32, 96 }, n));
+        }
+    }
+    test_cases.emplace_back(new test_pool1d_amax({ 2048, 8, 3, 1 }));
 
 #if 0
     // >4GB im2col destination. Too slow to run by default.
@@ -11529,6 +11641,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat_id_shared(type, n));
         }
     }
+    // shared expert with its own type or size (e.g. Flint): not one kernel, but one quantized input
+    for (int64_t n : { 1, 2, 9 }) {
+        test_cases.emplace_back(new test_mul_mat_id_shared(GGML_TYPE_Q4_K, n, GGML_TYPE_Q4_K, 256));
+        test_cases.emplace_back(new test_mul_mat_id_shared(GGML_TYPE_IQ4_XS, n, GGML_TYPE_Q8_0, 256));
+        test_cases.emplace_back(new test_mul_mat_id_shared(GGML_TYPE_Q5_K, n, GGML_TYPE_Q8_0, 128));
+    }
 
     // gpt-oss issue with Vulkan mmq_id
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_MXFP4, GGML_TYPE_F32, 32, 2, false, 2880, 32, 2880));
@@ -12176,6 +12294,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                     test_cases.emplace_back(new test_flash_attn_ext(hs, hs, nh, {nr2, 1}, 1024, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
                 }
             }
+        }
+    }
+
+    // MTP target verification on Qwen3.5/3.8 27B: 4 tokens, 24 Q heads over 4 KV heads, q8_0 KV, one or more sequences
+    for (int64_t kv : { 512, 8192, 8213, 33000 }) {
+        for (int64_t n_seq : { 1, 4 }) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, n_seq}, kv, 4, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
         }
     }
 
@@ -12888,6 +13013,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // flint decode: 256 experts with n_ff 512, 6 used, n_embd 2048, small K on the down projection
+    for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS, GGML_TYPE_Q8_0,
+                             GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S}) {
+        test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, GGML_TYPE_F32, 256, 6, false, 512, 1, 2048, 1));
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 256, 6, false, 2048, 1, 512));
+    }
+    for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{{4096, 2048}, {5120, 2048}, {2048, 4096}, {512, 2048}, {1024, 2048}, {2048, 1024}}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, m, 1, k, {1, 1}, {1, 1}));
+    }
     for (int K : {3, 5}) {
         for (int IC : {256, 2560}) {
             for (int IW_IH : {32, 64, 256}) {
@@ -12949,6 +13083,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 20000, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 10000, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 20000, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+
+    for (int64_t n_seq : { 1, 4 }) {
+        for (int64_t kv : { 1024, 4096, 8192, 16384, 32768, 101120 }) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, n_seq}, kv, 4, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+        }
+    }
 
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 4096, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 4096, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));

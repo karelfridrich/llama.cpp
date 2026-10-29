@@ -1,6 +1,7 @@
 #include "common.cuh"
 #include "fattn-common.cuh"
 #include "fattn-mma-f16.cuh"
+#include "fattn-q8-volta.cuh"
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
@@ -537,6 +538,7 @@ enum best_fattn_kernel {
     BEST_FATTN_KERNEL_TILE    = 200,
     BEST_FATTN_KERNEL_VEC     = 100,
     BEST_FATTN_KERNEL_MMA_F16 = 400,
+    BEST_FATTN_KERNEL_Q8_VOLTA = 500,
 };
 
 // K/V types for which there is a vector kernel template instance, other kernels convert these to f16:
@@ -688,6 +690,11 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         gqa_ratio_eff *= 2;
     }
 
+    static const bool q8_volta_disabled = getenv("GGML_CUDA_DISABLE_VOLTA_Q8_FATTN") != nullptr;
+    if (volta_mma_available(cc) && !q8_volta_disabled && ggml_q8v::supports(dst)) {
+        return BEST_FATTN_KERNEL_Q8_VOLTA;
+    }
+
     if (volta_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
         if (can_use_vector_kernel && Q->ne[1] * gqa_ratio_eff <= 2) {
             return BEST_FATTN_KERNEL_VEC;
@@ -754,6 +761,10 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
     const best_fattn_kernel kernel = ggml_cuda_get_best_fattn_kernel(device, dst);
 
+    if (kernel == BEST_FATTN_KERNEL_Q8_VOLTA) {
+        return ggml_q8v::get_alloc_size(dst);
+    }
+
     bool need_f16_K = false;
     bool need_f16_V = false;
 
@@ -768,6 +779,7 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
             need_f16_K = K->type == GGML_TYPE_F32 || f16_fallback;
             need_f16_V = V->type == GGML_TYPE_F32 || f16_fallback;
         } break;
+        case BEST_FATTN_KERNEL_Q8_VOLTA:
         case BEST_FATTN_KERNEL_NONE:
             break;
     }
@@ -791,6 +803,9 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             break;
         case BEST_FATTN_KERNEL_MMA_F16:
             ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);
+            break;
+        case BEST_FATTN_KERNEL_Q8_VOLTA:
+            ggml_q8v::launch(ctx, dst);
             break;
     }
 }
