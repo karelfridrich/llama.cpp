@@ -1,3 +1,6 @@
+> **This is branch `vulkan-gdn-state` of [karelfridrich/llama.cpp](https://github.com/karelfridrich/llama.cpp)**: gated delta net state written straight into the cache on Vulkan.
+> What it changes and why: [FORK-vulkan-gdn-state.md](FORK-vulkan-gdn-state.md). The rest of this README is upstream's.
+
 # llama.cpp
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
