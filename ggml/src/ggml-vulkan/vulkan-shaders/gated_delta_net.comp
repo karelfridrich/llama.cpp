@@ -32,6 +32,9 @@ layout(push_constant) uniform Parameters {
     uint neq1, rq3;
     float scale;
     uint K;
+    // a fused CPY of the new state into the recurrent cache: 1 writes the state there instead of to dst
+    uint cache_mode;
+    uint c_off, c_nb1, c_nb2;
 };
 
 layout(binding = 0) readonly  buffer QBuf     { FLOAT_TYPE data_q[];     };
@@ -41,6 +44,7 @@ layout(binding = 3) readonly  buffer GBuf     { FLOAT_TYPE data_g[];     };
 layout(binding = 4) readonly  buffer BetaBuf  { FLOAT_TYPE data_beta[];  };
 layout(binding = 5) readonly  buffer StateBuf { FLOAT_TYPE data_state[]; };
 layout(binding = 6)           buffer DstBuf   { FLOAT_TYPE data_dst[];   };
+layout(binding = 7) writeonly buffer CacheBuf { FLOAT_TYPE data_cache[]; };
 
 #if !USE_SUBGROUP_ADD && !USE_SUBGROUP_CLUSTERED
 shared FLOAT_TYPE temp[SUBGROUP_SIZE];
@@ -89,6 +93,22 @@ FLOAT_TYPE reduce_partial(FLOAT_TYPE partial) {
 #else
             return reduce_add_shmem(partial);
 #endif
+    }
+}
+
+// one snapshot slot of this lane's state rows, to dst or straight into the recurrent cache
+void store_state(const FLOAT_TYPE s_shard[ROWS_PER_LANE], const uint slot, const uint seq_id, const uint head_id,
+                 const uint col, const uint lane, const uint state_out_base, const uint state_size_per_snap) {
+    const uint base = cache_mode != 0u
+        ? c_off + slot * c_nb2 + seq_id * c_nb1 + head_id * S_V * S_V
+        : s_off + slot * state_size_per_snap + state_out_base;
+    [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+        const uint i = base + col * S_V + r * LANES_PER_COLUMN + lane;
+        if (cache_mode != 0u) {
+            data_cache[i] = s_shard[r];
+        } else {
+            data_dst[i] = s_shard[r];
+        }
     }
 }
 
@@ -173,17 +193,12 @@ void main() {
         if (K > 1u) {
             const int target_slot = int(n_tokens) - 1 - int(t);
             if (target_slot >= 0 && target_slot < int(K)) {
-                const uint slot_base = s_off + uint(target_slot) * state_size_per_snap + state_out_base;
-                [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
-                    data_dst[slot_base + col * S_V + r * LANES_PER_COLUMN + lane] = s_shard[r];
-                }
+                store_state(s_shard, uint(target_slot), seq_id, head_id, col, lane, state_out_base, state_size_per_snap);
             }
         }
     }
 
     if (K == 1u) {
-        [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
-            data_dst[s_off + state_out_base + col * S_V + r * LANES_PER_COLUMN + lane] = s_shard[r];
-        }
+        store_state(s_shard, 0u, seq_id, head_id, col, lane, state_out_base, state_size_per_snap);
     }
 }
