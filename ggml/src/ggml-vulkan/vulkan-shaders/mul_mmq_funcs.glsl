@@ -596,6 +596,185 @@ ACC_TYPE mmq_dot_product(const uint ib_a) {
 }
 #endif
 
+#if defined(DATA_A_IQ2_XXS) || defined(DATA_A_IQ2_XS) || defined(DATA_A_IQ2_S)
+// 8 grid values (4 bytes each in grid.x and grid.y, 8..43) with their 8 signs into qs[2 * iqs], qs[2 * iqs + 1]
+void iq2_grid_to_shmem(const uint buf_ib, const uint iqs, const uvec2 grid, const uint signs) {
+    const ivec4 vals0 = ivec4(unpack8(grid.x));
+    const ivec4 vals1 = ivec4(unpack8(grid.y));
+
+    // negate with (v ^ -s) - -s to avoid branches
+    const ivec4 m0 = -(ivec4(signs,      signs >> 1, signs >> 2, signs >> 3) & 1);
+    const ivec4 m1 = -(ivec4(signs >> 4, signs >> 5, signs >> 6, signs >> 7) & 1);
+
+    buf_a[buf_ib].qs[2 * iqs    ] = pack32(i8vec4((vals0 ^ m0) - m0));
+    buf_a[buf_ib].qs[2 * iqs + 1] = pack32(i8vec4((vals1 ^ m1) - m1));
+}
+
+// 7 sign bits, the 8th is their parity
+uint iq2_signs_with_parity(const uint sign7) {
+    return sign7 | ((bitCount(sign7) & 1) << 7);
+}
+
+void iq2_zero_to_shmem(const uint buf_ib, const uint iqs) {
+    buf_a[buf_ib].qs[2 * iqs] = 0;
+    buf_a[buf_ib].qs[2 * iqs + 1] = 0;
+}
+#endif
+
+#if defined(DATA_A_IQ2_XXS)
+void block_a_to_shmem(const uint buf_ib, const uint ib, const uint iqs, const bool is_in_bounds) {
+    if (is_in_bounds) {
+        const uint ib_k = ib / 8;
+        const uint ib32 = ib % 8;
+
+        const uint idx = (uint(data_a_packed16[ib_k].qs[4 * ib32 + iqs / 2]) >> (8 * (iqs & 1))) & 0xFF;
+        const uint signscale = pack32(u16vec2(data_a_packed16[ib_k].qs[4 * ib32 + 2], data_a_packed16[ib_k].qs[4 * ib32 + 3]));
+
+        iq2_grid_to_shmem(buf_ib, iqs, iq2xxs_grid[idx], iq2_signs_with_parity(bitfieldExtract(signscale, 7 * int(iqs), 7)));
+
+        if (iqs == 0) {
+            buf_a[buf_ib].d = FLOAT_TYPE(float(data_a_packed16[ib_k].d) * 0.25 * (0.5 + (signscale >> 28)));
+        }
+    } else {
+        iq2_zero_to_shmem(buf_ib, iqs);
+
+        if (iqs == 0) {
+            buf_a[buf_ib].d = FLOAT_TYPE(0.0f);
+        }
+    }
+}
+
+void block_a_to_registers(const uint reg_ib, const uint buf_ib) {
+    cache_a[reg_ib].d = buf_a[buf_ib].d;
+
+    [[unroll]] for (uint iqs = 0; iqs < 8; iqs++) {
+        cache_a[reg_ib].qs[iqs] = buf_a[buf_ib].qs[iqs];
+    }
+}
+
+ACC_TYPE mmq_dot_product(const uint ib_a) {
+    int32_t q_sum = 0;
+    [[unroll]] for (uint iqs = 0; iqs < 8; iqs++) {
+        q_sum += dotPacked4x8EXT(cache_a[ib_a].qs[iqs], cache_b.qs[iqs]);
+    }
+
+    return ACC_TYPE(float(cache_a[ib_a].d) * float(cache_b.ds.x) * float(q_sum));
+}
+#endif
+
+#if defined(DATA_A_IQ2_XS) || defined(DATA_A_IQ2_S)
+// the two 16-value halves have their own scale, d.x and d.y
+vec2 iq2_half_scales(const uint ib_k, const uint ib32) {
+    const uint scales = (uint(data_a_packed16[ib_k].scales[ib32 / 2]) >> (8 * (ib32 & 1))) & 0xFF;
+    const float d = float(data_a_packed16[ib_k].d) * 0.25;
+    return vec2(d * (0.5 + (scales & 0xF)), d * (0.5 + (scales >> 4)));
+}
+
+void block_a_to_shmem(const uint buf_ib, const uint ib, const uint iqs, const bool is_in_bounds) {
+    if (is_in_bounds) {
+        const uint ib_k = ib / 8;
+        const uint ib32 = ib % 8;
+
+#if defined(DATA_A_IQ2_XS)
+        const uint qs = uint(data_a_packed16[ib_k].qs[4 * ib32 + iqs]);
+        iq2_grid_to_shmem(buf_ib, iqs, iq2xs_grid[qs & 511], iq2_signs_with_parity(qs >> 9));
+#else
+        const uint shift = 8 * (iqs & 1);
+        const uint qs    = (uint(data_a_packed16[ib_k].qs[2 * ib32 + iqs / 2]) >> shift) & 0xFF;
+        const uint signs = (uint(data_a_packed16[ib_k].qs[QUANT_K / 16 + 2 * ib32 + iqs / 2]) >> shift) & 0xFF;
+        const uint qh    = (uint(data_a_packed16[ib_k].qh[ib32 / 2]) >> (8 * (ib32 & 1) + 2 * iqs)) & 3;
+        iq2_grid_to_shmem(buf_ib, iqs, iq2s_grid[qs | (qh << 8)], signs);
+#endif
+
+        if (iqs == 0) {
+            buf_a[buf_ib].d = FLOAT_TYPEV2(iq2_half_scales(ib_k, ib32));
+        }
+    } else {
+        iq2_zero_to_shmem(buf_ib, iqs);
+
+        if (iqs == 0) {
+            buf_a[buf_ib].d = FLOAT_TYPEV2(0.0f);
+        }
+    }
+}
+
+void block_a_to_registers(const uint reg_ib, const uint buf_ib) {
+    cache_a[reg_ib].d = buf_a[buf_ib].d;
+
+    [[unroll]] for (uint iqs = 0; iqs < 8; iqs++) {
+        cache_a[reg_ib].qs[iqs] = buf_a[buf_ib].qs[iqs];
+    }
+}
+
+ACC_TYPE mmq_dot_product(const uint ib_a) {
+    int32_t q_sum[2] = {0, 0};
+    [[unroll]] for (uint iqs = 0; iqs < 8; iqs++) {
+        q_sum[iqs / 4] += dotPacked4x8EXT(cache_a[ib_a].qs[iqs], cache_b.qs[iqs]);
+    }
+
+    return ACC_TYPE(float(cache_b.ds.x) * (float(cache_a[ib_a].d.x) * float(q_sum[0]) + float(cache_a[ib_a].d.y) * float(q_sum[1])));
+}
+#endif
+
+#if defined(DATA_A_IQ3_XXS)
+// 2-byte loads for IQ3_XXS blocks (98 bytes)
+void block_a_to_shmem(const uint buf_ib, const uint ib, const uint iqs, const bool is_in_bounds) {
+    if (is_in_bounds) {
+        const uint ib_k = ib / 8;
+        const uint ib32 = ib % 8;
+
+        // grid indices for values 8 * iqs .. 8 * iqs + 7
+        const uint qs = uint(data_a_packed16[ib_k].qs[ib32 * 4 + iqs]);
+        const uint signscale = pack32(u16vec2(data_a_packed16[ib_k].qs[QUANT_K / 8 + 2 * ib32],
+                                              data_a_packed16[ib_k].qs[QUANT_K / 8 + 2 * ib32 + 1]));
+        // 7 sign bits, the 8th is their parity
+        uint signs = bitfieldExtract(signscale, 7 * int(iqs), 7);
+        signs |= (bitCount(signs) & 1) << 7;
+
+        // grid holds 4 values of 4..62, one per byte
+        const ivec4 vals0 = ivec4(unpack8(iq3xxs_grid[qs & 0xFF]));
+        const ivec4 vals1 = ivec4(unpack8(iq3xxs_grid[qs >> 8]));
+
+        // negate with (v ^ -s) - -s to avoid branches
+        const ivec4 m0 = -(ivec4(signs,      signs >> 1, signs >> 2, signs >> 3) & 1);
+        const ivec4 m1 = -(ivec4(signs >> 4, signs >> 5, signs >> 6, signs >> 7) & 1);
+
+        buf_a[buf_ib].qs[2 * iqs    ] = pack32(i8vec4((vals0 ^ m0) - m0));
+        buf_a[buf_ib].qs[2 * iqs + 1] = pack32(i8vec4((vals1 ^ m1) - m1));
+
+        if (iqs == 0) {
+            buf_a[buf_ib].d = FLOAT_TYPE(float(data_a_packed16[ib_k].d) * 0.5 * (0.5 + (signscale >> 28)));
+        }
+    } else {
+        buf_a[buf_ib].qs[2 * iqs] = 0;
+        buf_a[buf_ib].qs[2 * iqs + 1] = 0;
+
+        if (iqs == 0) {
+            buf_a[buf_ib].d = FLOAT_TYPE(0.0f);
+        }
+    }
+}
+#endif
+
+#if defined(DATA_A_IQ3_XXS) || defined(DATA_A_IQ3_S)
+void block_a_to_registers(const uint reg_ib, const uint buf_ib) {
+    cache_a[reg_ib].d = buf_a[buf_ib].d;
+
+    [[unroll]] for (uint iqs = 0; iqs < 8; iqs++) {
+        cache_a[reg_ib].qs[iqs] = buf_a[buf_ib].qs[iqs];
+    }
+}
+
+ACC_TYPE mmq_dot_product(const uint ib_a) {
+    int32_t q_sum = 0;
+    [[unroll]] for (uint iqs = 0; iqs < 8; iqs++) {
+        q_sum += dotPacked4x8EXT(cache_a[ib_a].qs[iqs], cache_b.qs[iqs]);
+    }
+
+    return ACC_TYPE(float(cache_a[ib_a].d) * float(cache_b.ds.x) * float(q_sum));
+}
+#endif
+
 #if defined(DATA_A_IQ3_S)
 // 2-byte loads for IQ3_S blocks (110 bytes)
 void block_a_to_shmem(const uint buf_ib, const uint ib, const uint iqs, const bool is_in_bounds) {
@@ -634,23 +813,6 @@ void block_a_to_shmem(const uint buf_ib, const uint ib, const uint iqs, const bo
             buf_a[buf_ib].d = FLOAT_TYPE(0.0f);
         }
     }
-}
-
-void block_a_to_registers(const uint reg_ib, const uint buf_ib) {
-    cache_a[reg_ib].d = buf_a[buf_ib].d;
-
-    [[unroll]] for (uint iqs = 0; iqs < 8; iqs++) {
-        cache_a[reg_ib].qs[iqs] = buf_a[buf_ib].qs[iqs];
-    }
-}
-
-ACC_TYPE mmq_dot_product(const uint ib_a) {
-    int32_t q_sum = 0;
-    [[unroll]] for (uint iqs = 0; iqs < 8; iqs++) {
-        q_sum += dotPacked4x8EXT(cache_a[ib_a].qs[iqs], cache_b.qs[iqs]);
-    }
-
-    return ACC_TYPE(float(cache_a[ib_a].d) * float(cache_b.ds.x) * float(q_sum));
 }
 #endif
 
