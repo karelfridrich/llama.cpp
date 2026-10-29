@@ -135,15 +135,20 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     float * x_df = (float *) (x_qs + txs.qs);
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
 
-    constexpr int blocks_per_iter = MMQ_ITER_K / QK2_0;
-    constexpr int threads_per_row = blocks_per_iter * QI2_0;
+    // Q2_0 (group 64) and PQ2_0 (group 128): same codec, so only the block size differs
+    using block_t = std::conditional_t<type == GGML_TYPE_PQ2_0, block_pq2_0, block_q2_0>;
+    constexpr int qk = ggml_cuda_type_traits<type>::qk;
+    constexpr int qi = ggml_cuda_type_traits<type>::qi;
+
+    constexpr int blocks_per_iter = MMQ_ITER_K / qk;
+    constexpr int threads_per_row = blocks_per_iter * qi;
     constexpr int nrows = warp_size / threads_per_row;
-    constexpr int scale_entries_per_block = QK2_0 / QK8_1;
+    constexpr int scale_entries_per_block = qk / QK8_1;
     constexpr int scale_entries_per_row = blocks_per_iter * scale_entries_per_block;
 
     const int txi  = threadIdx.x % threads_per_row;
-    const int kbx  = txi / QI2_0;
-    const int kqsx = txi % QI2_0;
+    const int kbx  = txi / qi;
+    const int kqsx = txi % qi;
 
 #pragma unroll
     for (int i0 = 0; i0 < I; i0 += nrows*nwarps) {
@@ -153,7 +158,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
             i = min(i, i_max);
         }
 
-        const block_q2_0 * bxi = (const block_q2_0 *) x + kbx0 + i*stride + kbx;
+        const block_t    * bxi = (const block_t *) x + kbx0 + i*stride + kbx;
         const int16_t    * qxi = (const int16_t *) bxi->qs + kqsx * 4;
 
         const int dst_offset = kbx*(scale_entries_per_block*QI8_0) + kqsx*QI8_0;
@@ -198,7 +203,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
             i = min(i, i_max);
         }
 
-        const block_q2_0 * bxi = (const block_q2_0 *) x + kbx0 + i*stride + scale_block;
+        const block_t    * bxi = (const block_t *) x + kbx0 + i*stride + scale_block;
 
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
         x_df[i*sram_stride                           + ksx] = bxi->d;

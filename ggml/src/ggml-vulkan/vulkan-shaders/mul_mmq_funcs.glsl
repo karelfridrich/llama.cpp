@@ -6,11 +6,17 @@
 
 // Each iqs value maps to a 32-bit integer
 
-#if defined(DATA_A_Q2_0)
+#if defined(DATA_A_Q2_0) || defined(DATA_A_PQ2_0)
+// ib counts 32-value chunks: 2 per Q2_0 block, 4 per PQ2_0 block
+#if defined(DATA_A_PQ2_0)
+#define Q2_CHUNKS 4u
+#else
+#define Q2_CHUNKS 2u
+#endif
 void block_a_to_shmem(const uint buf_ib, const uint ib, const uint iqs, const bool is_in_bounds) {
     if (is_in_bounds) {
-        const uint block_idx = ib / 2;
-        const uint byte_idx = (ib & 1u) * 8u + iqs;
+        const uint block_idx = ib / Q2_CHUNKS;
+        const uint byte_idx = (ib % Q2_CHUNKS) * 8u + iqs;
         const uint bits = uint(data_a[block_idx].qs[byte_idx]);
         buf_a[buf_ib].qs[iqs] = pack32(i8vec4(
             int8_t(bits & 3u),
