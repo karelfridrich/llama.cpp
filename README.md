@@ -1,3 +1,6 @@
+> **This is branch `cuda-volta` of [karelfridrich/llama.cpp](https://github.com/karelfridrich/llama.cpp)**: CUDA speedups for Volta (V100).
+> What it changes and why: [FORK-cuda-volta.md](FORK-cuda-volta.md). The rest of this README is upstream's.
+
 # llama.cpp
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
