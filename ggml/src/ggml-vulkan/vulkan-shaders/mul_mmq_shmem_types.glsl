@@ -65,7 +65,13 @@ struct block_a_cache {
     int32_t qs[8];
     FLOAT_TYPE d;
 };
-#elif defined(DATA_A_IQ3_S)
+#elif defined(DATA_A_IQ2_XS) || defined(DATA_A_IQ2_S)
+#define QUANT_R_MMQ 2
+struct block_a_cache {
+    int32_t qs[8];
+    FLOAT_TYPEV2 d;
+};
+#elif defined(DATA_A_IQ2_XXS) || defined(DATA_A_IQ3_XXS) || defined(DATA_A_IQ3_S)
 #define QUANT_R_MMQ 2
 struct block_a_cache {
     int32_t qs[8];
