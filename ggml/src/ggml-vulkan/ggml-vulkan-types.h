@@ -537,6 +537,8 @@ static constexpr std::initializer_list<ggml_op> rms_norm_mul_rope_view_set_rows_
 static constexpr std::initializer_list<ggml_op> rms_norm_view_set_rows_pattern { GGML_OP_RMS_NORM, GGML_OP_VIEW, GGML_OP_SET_ROWS };
 
 static constexpr std::initializer_list<ggml_op> rope_view_set_rows_pattern { GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS };
+// MUL(signs) -> RESHAPE -> MUL_MAT(hadamard), fused into one signed FWHT
+static constexpr std::initializer_list<ggml_op> fwht_signed_pattern { GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_MUL_MAT };
 
 // scale_out*sigmoid(scale_in*x) as the hc_post weights (qwen4exp hc_combine)
 static constexpr std::initializer_list<ggml_op> hc_post_gate_pattern { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_DSV4_HC_POST };
@@ -936,6 +938,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_cross_entropy_loss_back_f32, pipeline_cross_entropy_loss_back_f32_wg512;
     // FWHT block widths 64..8192 (ggml_vk_fwht_pipeline_idx), and the rows a workgroup covers, chosen per width
     vk_pipeline pipeline_fwht_f32[8];
+    vk_pipeline pipeline_fwht_signed_f32[8];
     uint32_t fwht_rows_per_wg[8] = {};
     vk_pipeline pipeline_cumsum_f32;
     vk_pipeline pipeline_cumsum_small_f32;
@@ -1283,6 +1286,8 @@ struct ggml_backend_vk_context {
     int fused_ops_write_mask {};
     topk_moe_mode fused_topk_moe_mode {};
     bool fused_topk_moe_scale {};
+    // set when the current node leads a MUL -> RESHAPE -> MUL_MAT(hadamard) fusion
+    bool fused_fwht_signed {};
     // QSA indexer gather+add+top_k fused into one radix-select
     bool fused_topk_qsa {};
     bool fused_hc_post_gate {};

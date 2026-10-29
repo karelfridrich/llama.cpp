@@ -3600,6 +3600,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             if (use_subgroup && !wide) {
                 if (device->subgroup_size <= n) {
                     ggml_vk_create_pipeline(device, device->pipeline_fwht_f32[idx], "fwht_f32", fwht_f32_len, fwht_f32_data, "main", 2, sizeof(vk_op_fwht_push_constants), {1, 1, 1}, { device->subgroup_size, n, rows_narrow }, 1, true, true, device->subgroup_size);
+                    ggml_vk_create_pipeline(device, device->pipeline_fwht_signed_f32[idx], "fwht_signed_f32", fwht_signed_f32_len, fwht_signed_f32_data, "main", 3, sizeof(vk_op_fwht_signed_push_constants), {1, 1, 1}, { device->subgroup_size, n, rows_narrow }, 1, true, true, device->subgroup_size);
                     device->fwht_rows_per_wg[idx] = rows_narrow;
                 }
             } else {
@@ -7237,6 +7238,65 @@ bool ggml_vk_can_use_fwht(const ggml_backend_vk_context * ctx, const ggml_tensor
     GGML_ASSERT(ggml_is_contiguous(dst));
 
     return true;
+}
+
+// MUL(signs) -> RESHAPE -> MUL_MAT(hadamard): the transform applies the sign vector while it loads its row,
+// so the separate elementwise pass is skipped (from PrismML)
+static bool ggml_vk_can_fuse_fwht_signed(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    if (!ggml_can_fuse_subgraph(cgraph, node_idx, fwht_signed_pattern, { node_idx + 2 })) {
+        return false;
+    }
+
+    const ggml_tensor * mul     = cgraph->nodes[node_idx];
+    const ggml_tensor * reshape = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * mm      = cgraph->nodes[node_idx + 2];
+
+    if (reshape->src[0] != mul || mm->src[1] != reshape || ggml_get_op_params_i32(mm, 1) != GGML_HINT_SRC0_IS_HADAMARD) {
+        return false;
+    }
+
+    const ggml_tensor * x     = ggml_are_same_shape(mul, mul->src[0]) ? mul->src[0] : mul->src[1];
+    const ggml_tensor * signs = (x == mul->src[0]) ? mul->src[1] : mul->src[0];
+
+    const int64_t n = mm->src[0]->ne[0];
+    const int idx = ggml_vk_fwht_pipeline_idx(n);
+    if (idx < 0 || ctx->device->pipeline_fwht_signed_f32[idx] == nullptr) {
+        return false;
+    }
+
+    return signs->type == GGML_TYPE_F32 && signs->ne[1] == 1 && signs->ne[2] == 1 && signs->ne[3] == 1 &&
+        x->type == GGML_TYPE_F32 && mul->type == GGML_TYPE_F32 && mm->type == GGML_TYPE_F32 &&
+        ggml_is_contiguous(x) && ggml_is_contiguous(signs) && ggml_is_contiguous(mm) &&
+        ggml_are_same_shape(mm->src[1], mm) &&
+        signs->ne[0] == x->ne[0] && x->ne[0] % n == 0;
+}
+
+static void ggml_vk_fwht_signed(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    const ggml_tensor * mul = cgraph->nodes[node_idx];
+    const ggml_tensor * mm  = cgraph->nodes[node_idx + 2];
+
+    const ggml_tensor * x     = ggml_are_same_shape(mul, mul->src[0]) ? mul->src[0] : mul->src[1];
+    const ggml_tensor * signs = (x == mul->src[0]) ? mul->src[1] : mul->src[0];
+
+    const int64_t n = mm->src[0]->ne[0];
+    vk_pipeline pipeline = ctx->device->pipeline_fwht_signed_f32[ggml_vk_fwht_pipeline_idx(n)];
+
+    const uint32_t rows_per_workgroup = ctx->device->fwht_rows_per_wg[ggml_vk_fwht_pipeline_idx(n)];
+    const uint32_t n_rows = (uint32_t)(ggml_nelements(x) / n);
+    const uint32_t workgroups_x = std::min(CEIL_DIV(n_rows, rows_per_workgroup), ctx->device->properties.limits.maxComputeWorkGroupCount[0]);
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    vk_op_fwht_signed_push_constants pc = {
+        n_rows,
+        (uint32_t)(get_misalign_bytes(ctx, x)     / ggml_type_size(x->type)),
+        (uint32_t)(get_misalign_bytes(ctx, mm)    / ggml_type_size(mm->type)),
+        (uint32_t)(get_misalign_bytes(ctx, signs) / ggml_type_size(signs->type)),
+        (uint32_t)signs->ne[0],
+        1.0f / std::sqrt((float)n),
+    };
+
+    // bindings follow the shader: 0 = x, 1 = dst, 2 = signs
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { ggml_vk_tensor_subbuffer(ctx, x, true), ggml_vk_tensor_subbuffer(ctx, mm, true), ggml_vk_tensor_subbuffer(ctx, signs, true) }, pc, { workgroups_x, 1, 1 });
 }
 
 void ggml_vk_fwht(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src, ggml_tensor * dst) {
@@ -12575,7 +12635,9 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
 
         break;
     case GGML_OP_MUL:
-        if (ctx->num_additional_fused_ops) {
+        if (ctx->fused_fwht_signed) {
+            ggml_vk_fwht_signed(ctx, compute_ctx, cgraph, node_idx);
+        } else if (ctx->num_additional_fused_ops) {
             ggml_vk_snake_dispatch_fused(ctx, compute_ctx, cgraph, node_idx);
         } else {
             ggml_vk_mul(ctx, compute_ctx, src0, src1, node);
@@ -14554,6 +14616,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_topk_qsa = false;
         ctx->fused_hc_post_gate = false;
         ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
+        ctx->fused_fwht_signed = false;
         const char *fusion_string {};
         if (!ctx->device->disable_fusion) {
             uint32_t num_adds = ggml_vk_fuse_multi_add(ctx, cgraph, i);
@@ -14561,6 +14624,13 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->num_additional_fused_ops = num_adds - 1;
                 fusion_string = "MULTI_ADD";
                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, true);
+            } else if (ggml_vk_can_fuse_fwht_signed(ctx, cgraph, i)) {
+                ctx->num_additional_fused_ops = 2;
+                ctx->fused_fwht_signed = true;
+                fusion_string = "MUL_RESHAPE_MUL_MAT";
+                op_srcs_fused_elementwise[0] = true;
+                op_srcs_fused_elementwise[1] = false;
+                op_srcs_fused_elementwise[2] = false;
             } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_ADD, GGML_OP_ADD })) {
                 ctx->num_additional_fused_ops = 2;
                 fusion_string = "MUL_MAT_ADD_ADD";
@@ -14796,6 +14866,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_topk_qsa = false;
                 ctx->fused_hc_post_gate = false;
                 ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
+                ctx->fused_fwht_signed = false;
                 fusion_string = nullptr;
             }
         }
@@ -14968,6 +15039,12 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
             return false;
         };
 
+        // only the Hadamard form, so other MUL -> RESHAPE -> MUL_MAT chains keep their scheduling
+        auto const &match_fwht_signed = [&](int start) -> bool {
+            return match_pattern(fwht_signed_pattern, start) &&
+                ggml_get_op_params_i32(graph->nodes[start + 2], 1) == GGML_HINT_SRC0_IS_HADAMARD;
+        };
+
         auto const &keep_pattern = [&](const std::initializer_list<ggml_op> &pattern) -> bool {
             if (match_pattern(pattern, first_unused)) {
                 for (size_t j = 0; j < pattern.size(); ++j) {
@@ -15051,6 +15128,10 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
         if (keep_pattern(rope_view_set_rows_pattern)) {
             continue;
         }
+        if (match_fwht_signed(first_unused)) {
+            keep_pattern(fwht_signed_pattern);
+            continue;
+        }
         if (match_pattern(hc_post_gate_pattern, first_unused)) {
             add_pattern_alloc_deps(hc_post_gate_pattern, first_unused + (int) hc_post_gate_pattern.size() - 1);
             keep_pattern(hc_post_gate_pattern);
@@ -15096,7 +15177,8 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 match_pattern(rms_norm_mul_rope_view_set_rows_pattern, j) ||
                 match_pattern(rms_norm_view_set_rows_pattern, j) ||
                 match_pattern(rope_view_set_rows_pattern, j) ||
-                match_pattern(hc_post_gate_pattern, j)) {
+                match_pattern(hc_post_gate_pattern, j) ||
+                match_fwht_signed(j)) {
                 continue;
             }
             bool ok = true;
