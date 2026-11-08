@@ -396,6 +396,10 @@ struct common_params_speculative {
     double synth_len = -1.0;
     std::vector<double> synth_rates;
 
+    // server: start new drafts only while at most this many slots are generating (0 = always); with more, the batch
+    // keeps the GPU busy and drafts mostly add verification work
+    int32_t max_slots = 0;
+
     // used by Simple, MTP, Eagle3, etc. - all methods that require some kind of draft model
     common_params_speculative_draft draft;
 

@@ -3806,6 +3806,14 @@ private:
         std::vector<server_slot *> drafting;
 
         // determine which slots are generating and drafting
+        // with more slots generating than --spec-draft-max-slots, only pending replays go through; no new drafts
+        int n_generating = 0;
+        for (const auto & slot : slots) {
+            n_generating += slot.state == SLOT_STATE_GENERATING;
+        }
+        const int  spec_max_slots = params_base.speculative.max_slots;
+        const bool spec_crowded   = spec_max_slots > 0 && n_generating > spec_max_slots;
+
         iterate(slots, [&](server_slot & slot) {
             if (slot.state != SLOT_STATE_GENERATING || slot.task->type == SERVER_TASK_TYPE_TTS || slot.task->type == SERVER_TASK_TYPE_REALTIME) {
                 return;
@@ -3843,7 +3851,7 @@ private:
                         if (use_ckpt_tgt) {
                             GGML_ASSERT(!slot.spec_ckpt.empty());
                         }
-                    } else {
+                    } else if (!spec_crowded) {
                         GGML_ASSERT(slot.spec_i_batch.empty());
 
                         slot.spec_ckpt.update_pos(
