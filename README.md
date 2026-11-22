@@ -30,7 +30,7 @@ Nothing fork-specific: build exactly like upstream ([build docs](docs/build.md))
 
 ```sh
 # V100
-cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=70 -DGGML_CUDA_FA_ALL_QUANTS=ON
+cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=70 -DGGML_CUDA_FA_QUANTS=all
 # RX 6800
 cmake -B build-vulkan -DGGML_VULKAN=ON
 ```
