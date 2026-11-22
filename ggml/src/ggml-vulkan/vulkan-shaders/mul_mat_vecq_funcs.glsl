@@ -8,6 +8,10 @@
 FLOAT_TYPE get_dm(uint ib) {
     return FLOAT_TYPE(data_a[ib / 2].d);
 }
+#elif defined(DATA_A_PQ2_0)
+FLOAT_TYPE get_dm(uint ib) {
+    return FLOAT_TYPE(data_a[ib / 4].d);
+}
 #elif defined(DATA_A_Q4_0) || defined(DATA_A_Q5_0) || defined(DATA_A_Q8_0) || defined(DATA_A_IQ1_S) || defined(DATA_A_IQ2_XXS) || defined(DATA_A_IQ2_XS) || defined(DATA_A_IQ2_S) || defined(DATA_A_IQ3_XXS) || defined(DATA_A_IQ3_S) || defined(DATA_A_IQ4_XS) || defined(DATA_A_IQ4_NL)
 FLOAT_TYPE get_dm(uint ib) {
     return FLOAT_TYPE(data_a[ib].d);
@@ -34,7 +38,7 @@ FLOAT_TYPEV2 get_dm(uint ib) {
 #endif
 
 // Each iqs value maps to a 32-bit integer
-#if defined(DATA_A_Q2_0)
+#if defined(DATA_A_Q2_0) || defined(DATA_A_PQ2_0)
 uint unpack_q2_0(uint bits) {
     // Move bit pairs [1:0], [3:2], [5:4], [7:6] to [1:0], [9:8], [17:16], [25:24].
     bits &= 0xffu;
@@ -42,10 +46,16 @@ uint unpack_q2_0(uint bits) {
     return (bits | (bits << 6u)) & 0x03030303u;
 }
 
+// ib counts 32-value chunks: 2 per Q2_0 block, 4 per PQ2_0 block
+#if defined(DATA_A_PQ2_0)
+#define Q2_CHUNKS 4u
+#else
+#define Q2_CHUNKS 2u
+#endif
 i32vec4 repack4(uint ib, uint iqs) {
-    const uint qs_idx = (ib & 1u) * 4u + iqs * 2u;
-    const uint bits = pack32(u16vec2(data_a_packed16[ib / 2].qs[qs_idx],
-                                     data_a_packed16[ib / 2].qs[qs_idx + 1]));
+    const uint qs_idx = (ib % Q2_CHUNKS) * 4u + iqs * 2u;
+    const uint bits = pack32(u16vec2(data_a_packed16[ib / Q2_CHUNKS].qs[qs_idx],
+                                     data_a_packed16[ib / Q2_CHUNKS].qs[qs_idx + 1]));
     return i32vec4(unpack_q2_0(bits), unpack_q2_0(bits >> 8u),
                    unpack_q2_0(bits >> 16u), unpack_q2_0(bits >> 24u));
 }
@@ -157,7 +167,7 @@ FLOAT_TYPE mul_q8_1(const int32_t q_sum, const float da, const vec2 dsb, const i
 }
 #endif
 
-#if defined(DATA_A_Q2_0)
+#if defined(DATA_A_Q2_0) || defined(DATA_A_PQ2_0)
 FLOAT_TYPE mmvq_dot_product(const uint ib_a, const uint iqs) {
     int32_t q_sum = 0;
     const i32vec4 qs_a = repack4(ib_a, iqs);

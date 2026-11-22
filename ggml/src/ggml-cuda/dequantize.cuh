@@ -23,8 +23,10 @@ static __device__ __forceinline__ void dequantize_q1_0(const void * vx, const in
     v.y = (2*bit_1 - 1) * d;
 }
 
-static __device__ __forceinline__ void dequantize_q2_0(const void * vx, const int64_t ib, const int iqs, float2 & v){
-    const block_q2_0 * x = (const block_q2_0 *) vx;
+// Q2_0 (group 64) and PQ2_0 (group 128) share the codec
+template <typename block_t>
+static __device__ __forceinline__ void dequantize_q2_0_t(const void * vx, const int64_t ib, const int iqs, float2 & v){
+    const block_t * x = (const block_t *) vx;
 
     const float d = x[ib].d;
 
@@ -41,6 +43,14 @@ static __device__ __forceinline__ void dequantize_q2_0(const void * vx, const in
 
     v.x = (c0 - 1) * d;
     v.y = (c1 - 1) * d;
+}
+
+static __device__ __forceinline__ void dequantize_q2_0(const void * vx, const int64_t ib, const int iqs, float2 & v){
+    dequantize_q2_0_t<block_q2_0>(vx, ib, iqs, v);
+}
+
+static __device__ __forceinline__ void dequantize_pq2_0(const void * vx, const int64_t ib, const int iqs, float2 & v){
+    dequantize_q2_0_t<block_pq2_0>(vx, ib, iqs, v);
 }
 
 static __device__ __forceinline__ void dequantize_q4_0(const void * vx, const int64_t ib, const int iqs, float2 & v){
