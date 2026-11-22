@@ -477,7 +477,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_tile(
         ggml_cuda_unroll<6>{}(load);
     } else {
         const half2 zero[4] = {{0.0f, 0.0f}, {0.0f, 0.0f}, {0.0f, 0.0f}, {0.0f, 0.0f}};
-        auto load = [&] __device__ (const int n) {
+        // use_rows: K/V rows come from indices, chosen at compile time to keep the inner loop lean
+        auto load = [&] __device__ (const int n, auto use_rows) {
             const int stride_k = 32 >> n;
             const int k0_start = stride_k == 32 ? 0 : chunks_per_row - chunks_per_row % (2*stride_k);
             const int k0_stop  =                      chunks_per_row - chunks_per_row % (1*stride_k);
@@ -503,11 +504,10 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_tile(
                     if constexpr (use_sparse) {
                         const int32_t index = i < i_sup ? indices[k_VKQ_0 + i] : -1;
                         src = index >= 0 ? KV + int64_t(index)*stride_KV + k*h2_per_chunk : zero;
-                    } else if (!oob_check || i < i_sup) {
-                        const int64_t i_KV = indices ? max(indices[k_VKQ_0 + i], 0) : k_VKQ_0 + i;
-                        src = KV + i_KV*stride_KV + k*h2_per_chunk;
+                    } else if constexpr (decltype(use_rows)::value) {
+                        src = !oob_check || i < i_sup ? KV + int64_t(max(indices[k_VKQ_0 + i], 0))*stride_KV + k*h2_per_chunk : zero;
                     } else {
-                        src = zero;
+                        src = !oob_check || i < i_sup ? KV + int64_t(k_VKQ_0 + i)*stride_KV + k*h2_per_chunk : zero;
                     }
                     ggml_cuda_memcpy_1<16>(swizzle<stride_tile>(tile_KV, i*stride_tile + k*h2_per_chunk, i), src);
                 }
@@ -519,7 +519,16 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_tile(
         // 4: max  4*16= 64 bytes,  32 half
         // 5: max  2*16= 32 bytes,  16 half
         // 6: max  1*16= 16 bytes,   8 half
-        ggml_cuda_unroll<6>{}(load);
+#ifdef VOLTA_MMA_AVAILABLE
+        // kv_rows needs Turing MMA, so Volta never gets indices here; the second path alone costs ~20% on V100
+        ggml_cuda_unroll<6>{}(load, std::false_type{});
+#else
+        if (!use_sparse && indices) {
+            ggml_cuda_unroll<6>{}(load, std::true_type{});
+        } else {
+            ggml_cuda_unroll<6>{}(load, std::false_type{});
+        }
+#endif // VOLTA_MMA_AVAILABLE
     }
 }
 

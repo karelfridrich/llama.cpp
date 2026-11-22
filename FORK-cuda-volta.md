@@ -17,11 +17,12 @@ Back to the [fork overview](https://github.com/karelfridrich/llama.cpp#readme).
 | small-K MMVQ for IQ types | The small-K mat-vec path for IQ quants, only when most of a block would idle (MoE down projections with K = 512) | Flint 112.1 -> 113.5 |
 | Q/K/V as one MMVQ | Separate Q/K/V weights stored back to back run as one mat-vec: one input quantization, one launch | Flint 114.1 -> 123.9, Qwen3-30B 135.4 -> 140.8 |
 | quantize the MoE input once | Routed and shared experts share one input quantization even when they can't share a kernel | Flint 123.9 -> 125.1 |
+| plain K/V loads in Volta flash attention | Since upstream #29510 the K/V tile loader checks for `kv_rows` per element. `kv_rows` needs Turing MMA and never reaches Volta, so Volta builds only the plain path | Gemma 4 31B pp512 at 16k 441 -> 492, Qwen3.8 27B 687 -> 722 |
 
 Now upstream, dropped in the November 2026 rebase: MMQ for MoE prefill (upstream uses MMQ for every MoE model on
 NVIDIA) and the sm70 flash-attention config for 256-wide heads (PR #27997).
 
-Numbers are `llama-bench` tg128 (single-stream decode, tokens/s) on a V100 PCIe 32 GB. Flint is `flint-UD-Q4_K_XL`.
+Numbers are `llama-bench` tg128 (single-stream decode, tokens/s) unless marked pp512 (prompt processing) on a V100 PCIe 32 GB. Flint is `flint-UD-Q4_K_XL`.
 
 ## Credits
 
