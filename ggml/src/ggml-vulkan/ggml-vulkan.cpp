@@ -1747,6 +1747,15 @@ static bool ggml_vk_matmul_shmem_support(const vk_device& device, const std::vec
     return supported;
 }
 
+// RDNA2 integer MMQ uses tiles of 256 invocations: the large tile for these types, the medium tile for the others
+static bool ggml_vk_rdna2_mmq_tiles(const vk_device& device) {
+    return device->architecture == vk_device_architecture::AMD_RDNA2 && !device->coopmat_support;
+}
+
+static bool ggml_vk_rdna2_mmq_large(ggml_type type) {
+    return type == GGML_TYPE_Q5_0 || type == GGML_TYPE_Q5_1 || type == GGML_TYPE_Q4_K;
+}
+
 // MMQ uses the mixed signedness dot product (MMQ_SUDOT) when the signed one is not accelerated
 static bool ggml_vk_mmq_use_sudot(const vk_device& device) {
     return device->integer_dot_mixed && !device->integer_dot_signed;
@@ -2016,7 +2025,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                           l_warptile_mmq_k, m_warptile_mmq_k, s_warptile_mmq_k,
                           l_warptile_mmqid, m_warptile_mmqid, s_warptile_mmqid,
                           l_warptile_mmqid_int, m_warptile_mmqid_int, s_warptile_mmqid_int,
-                          l_warptile_mmqid_int_k, m_warptile_mmqid_int_k, s_warptile_mmqid_int_k;
+                          l_warptile_mmqid_int_k, m_warptile_mmqid_int_k, s_warptile_mmqid_int_k,
+                          l_warptile_mmq_int_rdna2, m_warptile_mmq_int_rdna2;
     std::array<uint32_t, 3> l_wg_denoms, m_wg_denoms, s_wg_denoms,
                             l_mmq_wg_denoms, m_mmq_wg_denoms, s_mmq_wg_denoms,
                             l_mmq_wg_denoms_k, m_mmq_wg_denoms_k, s_mmq_wg_denoms_k,
@@ -2154,6 +2164,10 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         } else if (device->vendor_id == VK_VENDOR_ID_QUALCOMM && device->coopmat_support) {
             m_warptile     = { 64, 64, 64, 16, 64, 64, 1, tm_l, tn_l, tk_l, 64 };
             m_warptile_mmq = { 64, 64, 64, 32, 64, 64, 1, tm_m, tn_m, tk_m, 64 };
+        } else if (ggml_vk_rdna2_mmq_tiles(device)) {
+            // integer MMQ on RX 6800: 8 subgroups per tile instead of 4, Q8_0/IQ/Q5_K/Q6_K +6-23% (medium), Q5_0/Q5_1/Q4_K +8-12% (large)
+            m_warptile_mmq_int_rdna2 = { 256,  64,  64, 32, 16, 32, 1, 2, 2, 1, 32 };
+            l_warptile_mmq_int_rdna2 = { 256, 128, 128, 32, 32, 64, 2, 2, 4, 1, 32 };
         }
 
         l_mmq_wg_denoms = l_wg_denoms = {128, 128, 1 };
@@ -2994,7 +3008,17 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         auto sg_create_mmq = [&](vk_matmul_pipeline_key key, const std::vector<vk_tile_config>& tc_base,
                                  const std::string& name, size_t len, const void* data, uint32_t pc_size, uint32_t pc,
                                  uint32_t rsgs = 0) {
-            auto tc = filter_tc(tc_base, key.type_a, key.mul_mat_id, true);
+            std::vector<vk_tile_config> tc_tiles = tc_base;
+            // Q4_0, Q4_1 and Q3_K stay on the default tiles, they are not faster with the RDNA2 tiles
+            const bool rdna2_default = key.type_a == GGML_TYPE_Q4_0 || key.type_a == GGML_TYPE_Q4_1 || key.type_a == GGML_TYPE_Q3_K;
+            if (!m_warptile_mmq_int_rdna2.empty() && !key.mul_mat_id && !rdna2_default && tc_tiles.size() >= 3) {
+                if (ggml_vk_rdna2_mmq_large(key.type_a)) {
+                    tc_tiles[2].warptile = l_warptile_mmq_int_rdna2;
+                } else {
+                    tc_tiles[1].warptile = m_warptile_mmq_int_rdna2;
+                }
+            }
+            auto tc = filter_tc(tc_tiles, key.type_a, key.mul_mat_id, true);
             if (!tc.empty()) {
                 // constant_id 11 is MMQ_SUDOT
                 spec_fn_t mmq_spec = [&](const std::vector<uint32_t>& wt, bool) {
@@ -3282,7 +3306,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             return 0;
         };
     } else {
-        device->matmul_tile_selector = [](uint32_t m, uint32_t n, uint32_t /*k*/, uint32_t /*shader_core_count*/,
+        const bool rdna2 = ggml_vk_rdna2_mmq_tiles(device);
+        device->matmul_tile_selector = [rdna2](uint32_t m, uint32_t n, uint32_t /*k*/, uint32_t shader_core_count,
                                           const std::vector<vk_matmul_pipeline_pair>& configs) -> uint32_t {
             if (configs.size() <= 1) return 0;
             for (uint32_t i = 0; i < configs.size(); ++i) {
@@ -3293,6 +3318,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             if (last == 0 || m <= 32 || n <= 32) return 0;
             if (last == 1) return 1;
             if (m <= 64 || n <= 64) return 1;
+            // RDNA2: the large tile only with at least two of them per CU, else too few workgroups
+            if (rdna2 && CEIL_DIV(m, configs[last].unaligned->wg_denoms[0]) * CEIL_DIV(n, configs[last].unaligned->wg_denoms[1]) < 2*shader_core_count) return 1;
             return last;
         };
         device->matmul_id_tile_selector = device->matmul_tile_selector;
@@ -5570,7 +5597,7 @@ vk_device ggml_vk_get_device(size_t idx) {
             }
 #endif
 
-            device->mul_mat_l_int[i]    = device->mul_mat_l[i];
+            device->mul_mat_l_int[i]    = device->mul_mat_l[i] || (ggml_vk_rdna2_mmq_tiles(device) && ggml_vk_rdna2_mmq_large((ggml_type) i));
             device->mul_mat_m_int[i]    = device->mul_mat_m[i];
             device->mul_mat_s_int[i]    = device->mul_mat_s[i];
             device->mul_mat_id_l_int[i] = device->mul_mat_id_l[i];
