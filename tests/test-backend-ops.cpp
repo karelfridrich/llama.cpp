@@ -12268,6 +12268,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, m, 2, 1024, { 1, 1 }, { 1, 1 }));
     }
 
+    // MUL_MAT_ID prompt batches (CUDA Volta tensor-core path): broadcast and per-slot src1, full and partial tiles
+    for (ggml_type type_a : { GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS }) {
+        for (bool b : { false, true }) {
+            for (int n : { 128, 100 }) {
+                test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 32, 8, b,  512, n, 2048));
+                test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 32, 8, b, 2048, n,  512));
+            }
+        }
+    }
     // integer MMQ medium and large tiles, with and without tile-aligned sizes
     for (ggml_type type_a : { GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0, GGML_TYPE_MXFP4,
                               GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K,

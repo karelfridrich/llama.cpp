@@ -34,6 +34,7 @@
 #include "ggml-cuda/mmf.cuh"
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmq-few.cuh"
+#include "ggml-cuda/mmid-tc.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/moe-weighted-reduction.cuh"
@@ -2557,6 +2558,10 @@ static bool ggml_cuda_should_fuse_mul_mat_q(const ggml_tensor * up, const ggml_t
     if (use_mmvq || !ggml_cuda_should_use_mmq(x_up->type, cc, ncols, /*n_experts =*/ is_id ? x_up->ne[2] : 0)) {
         return false;
     }
+    // do not fuse the expert matmuls that the Volta tensor-core path takes in ggml_cuda_mul_mat_id
+    if (is_id && ggml_cuda_should_use_mmid_tc(x_up, y, up->src[2], cc)) {
+        return false;
+    }
 
     // The fused kernel needs one block per tile (no stream-k split), so only fuse if the tiling is efficient.
     return ggml_cuda_mmq_fusion_is_efficient(x_up->type, ggml_prec_get_src(up, 1), x_up->ne[1], ncols, nchannels, device);
@@ -2655,6 +2660,10 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
         return false;
     }
 
+    if (ggml_cuda_should_use_mmid_tc(src0, src1, dst->src[2], cc)) {
+        return false;
+    }
+
     if (ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[2], /*n_experts=*/src0->ne[2])) {
         return false;
     }
@@ -2709,6 +2718,11 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
         if (use_mmq_few) {
             ggml_cuda_mul_mat_q_few(ctx, src0, src1, ids, dst);
+            return;
+        }
+
+        if (ggml_cuda_should_use_mmid_tc(src0, src1, ids, cc)) {
+            ggml_cuda_mul_mat_id_tc(ctx, src0, src1, ids, dst);
             return;
         }
 
