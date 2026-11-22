@@ -82,30 +82,34 @@ static __global__ void dequantize_block_q8_0_f16(const void * __restrict__ vx, h
 }
 
 template<typename dst_t>
-static __global__ void dequantize_block_q4_0(const void * __restrict__ vx, dst_t * __restrict__ yy, int nb32) {
-
-    const int64_t i = blockIdx.x;
-
-    // assume 32 threads
-    const int64_t tid = threadIdx.x;
-    const int64_t il  = tid/8;
-    const int64_t ir  = tid%8;
-    const int64_t ib = 8*i + ir;
+static __global__ void dequantize_block_q4_0(const void * __restrict__ vx, dst_t * __restrict__ yy, int64_t nb32) {
+    // 4 threads per block of 32 values, each writes 8 consecutive values: a warp stores 8 whole blocks at once
+    const int64_t it = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    const int64_t ib = it/4;
     if (ib >= nb32) {
         return;
     }
+    const int j = it%4; // values 8*j .. 8*j+7: low nibbles of qs[0..15] for j < 2, high nibbles for j >= 2
 
-    dst_t * y = yy + 256*i + 32*ir + 4*il;
-
-    const block_q4_0 * x = (const block_q4_0 *)vx + ib;
-    const float d = __half2float(x->d);
+    const block_q4_0 * x = (const block_q4_0 *) vx + ib;
+    const float d  = __half2float(x->d);
     const float dm = -8*d;
 
-    const uint8_t * q = x->qs + 4*il;
+    const uint16_t * q16 = (const uint16_t *) (x->qs + 8*(j%2)); // qs starts 2 bytes into the block
+    const int shift = 4*(j/2);
 
+    dst_t v[8];
+#pragma unroll
     for (int l = 0; l < 4; ++l) {
-        y[l+ 0] = ggml_cuda_cast<dst_t>(d * (q[l] & 0xF) + dm);
-        y[l+16] = ggml_cuda_cast<dst_t>(d * (q[l] >>  4) + dm);
+        const uint32_t q = q16[l] >> shift;
+        v[2*l + 0] = ggml_cuda_cast<dst_t>(d*((q >> 0) & 0xF) + dm);
+        v[2*l + 1] = ggml_cuda_cast<dst_t>(d*((q >> 8) & 0xF) + dm);
+    }
+
+    uint4 * y = (uint4 *) (yy + 32*ib + 8*j);
+#pragma unroll
+    for (int s = 0; s < (int) (sizeof(v)/sizeof(uint4)); ++s) {
+        y[s] = ((const uint4 *) v)[s];
     }
 }
 
@@ -153,24 +157,104 @@ static __global__ void dequantize_block_q3_K(const void * __restrict__ vx, dst_t
 }
 
 template<typename dst_t>
-static __global__ void dequantize_block_q4_K(const void * __restrict__ vx, dst_t * __restrict__ yy) {
-    const int64_t i = blockIdx.x;
+static __device__ __forceinline__ void store_8(dst_t * __restrict__ y, const float * v) {
+    dst_t t[8];
+#pragma unroll
+    for (int l = 0; l < 8; ++l) {
+        t[l] = ggml_cuda_cast<dst_t>(v[l]);
+    }
+#pragma unroll
+    for (int s = 0; s < (int) (sizeof(t)/sizeof(uint4)); ++s) {
+        ((uint4 *) y)[s] = ((const uint4 *) t)[s];
+    }
+}
 
-    dequantize_q4_K(vx, i, yy + i*QK_K, threadIdx.x);
+// The K-quant conversions below use 32 threads per block of 256 values: thread t writes values 8*t .. 8*t+7,
+// so a warp stores one whole block of consecutive values.
+
+template<typename dst_t>
+static __global__ void dequantize_block_q4_K(const void * __restrict__ vx, dst_t * __restrict__ yy, const int64_t nb) {
+    const int64_t it = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    const int64_t ib = it/32;
+    if (ib >= nb) {
+        return;
+    }
+    const int t  = it%32;
+    const int c  = t/8;          // 64-value chunk, made of the 32 bytes qs[32*c ...]
+    const int o  = 8*(t%8);      // offset in the chunk: the low nibbles give 0..31, the high nibbles 32..63
+    const int hi = o >= 32;
+
+    const block_q4_K * x = (const block_q4_K *) vx + ib;
+    uint8_t sc, m;
+    get_scale_min_k4(2*c + hi, x->scales, sc, m);
+    const float d   = __low2float(x->dm)*sc;
+    const float min = __high2float(x->dm)*m;
+
+    const uint2 q2 = *(const uint2 *) (x->qs + 32*c + o%32);
+    const uint8_t * q = (const uint8_t *) &q2;
+    float v[8];
+#pragma unroll
+    for (int l = 0; l < 8; ++l) {
+        v[l] = d*((q[l] >> 4*hi) & 0xF) - min;
+    }
+    store_8(yy + 256*ib + 8*t, v);
 }
 
 template<typename dst_t>
-static __global__ void dequantize_block_q5_K(const void * __restrict__ vx, dst_t * __restrict__ yy) {
-    const int64_t i = blockIdx.x;
+static __global__ void dequantize_block_q5_K(const void * __restrict__ vx, dst_t * __restrict__ yy, const int64_t nb) {
+    const int64_t it = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    const int64_t ib = it/32;
+    if (ib >= nb) {
+        return;
+    }
+    const int t  = it%32;
+    const int c  = t/8;
+    const int o  = 8*(t%8);
+    const int hi = o >= 32;
+    const int j  = o%32;
 
-    dequantize_q5_K(vx, i, yy + i*QK_K, threadIdx.x);
+    const block_q5_K * x = (const block_q5_K *) vx + ib;
+    uint8_t sc, m;
+    get_scale_min_k4(2*c + hi, x->scales, sc, m);
+    const float d   = __low2float(x->dm)*sc;
+    const float min = __high2float(x->dm)*m;
+
+    const uint2 ql2 = *(const uint2 *) (x->qs + 32*c + j);
+    const uint2 qh2 = *(const uint2 *) (x->qh + j);
+    const uint8_t * ql = (const uint8_t *) &ql2;
+    const uint8_t * qh = (const uint8_t *) &qh2;
+    const int hbit = 2*c + hi;
+    float v[8];
+#pragma unroll
+    for (int l = 0; l < 8; ++l) {
+        v[l] = d*(((ql[l] >> 4*hi) & 0xF) | (((qh[l] >> hbit) & 1) << 4)) - min;
+    }
+    store_8(yy + 256*ib + 8*t, v);
 }
 
 template<typename dst_t>
-static __global__ void dequantize_block_q6_K(const void * __restrict__ vx, dst_t * __restrict__ yy) {
-    const int64_t i = blockIdx.x;
+static __global__ void dequantize_block_q6_K(const void * __restrict__ vx, dst_t * __restrict__ yy, const int64_t nb) {
+    const int64_t it = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    const int64_t ib = it/32;
+    if (ib >= nb) {
+        return;
+    }
+    const int t  = it%32;
+    const int ip = t/16;          // 128-value half
+    const int l0 = 8*(t%16);      // offset in the half
+    const int qr = l0/32;         // quarter: low/high nibble of ql[0..31] or ql[32..63], qh bits 2*qr
+    const int il = l0%32;
 
-    dequantize_q6_K(vx, i, yy + i*QK_K, threadIdx.x);
+    const block_q6_K * x = (const block_q6_K *) vx + ib; // 210 bytes, only 2-byte aligned: byte loads
+    const float d = __half2float(x->d)*x->scales[8*ip + il/16 + 2*qr];
+    const uint8_t * ql = x->ql + 64*ip + 32*(qr%2) + il;
+    const uint8_t * qh = x->qh + 32*ip + il;
+    float v[8];
+#pragma unroll
+    for (int l = 0; l < 8; ++l) {
+        v[l] = d*((int) (((ql[l] >> 4*(qr/2)) & 0xF) | (((qh[l] >> 2*qr) & 3) << 4)) - 32);
+    }
+    store_8(yy + 256*ib + 8*t, v);
 }
 
 template<typename dst_t>
@@ -289,9 +373,10 @@ static void dequantize_row_q3_K_cuda(const void * vx, dst_t * y, const int64_t k
 
 template<typename dst_t>
 static void dequantize_row_q4_0_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
-    const int nb32 = k / 32;
-    const int nb = (k + 255) / 256;
-    dequantize_block_q4_0<<<nb, 32, 0, stream>>>(vx, y, nb32);
+    const int64_t nb32 = k / 32;
+    GGML_ASSERT((uintptr_t) y % 16 == 0);
+    const int64_t nthreads = 4*nb32;
+    dequantize_block_q4_0<<<(nthreads + 255) / 256, 256, 0, stream>>>(vx, y, nb32);
 }
 
 template<typename dst_t>
@@ -303,20 +388,23 @@ static void dequantize_row_q4_1_cuda(const void * vx, dst_t * y, const int64_t k
 
 template<typename dst_t>
 static void dequantize_row_q4_K_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
-    const int nb = k / QK_K;
-    dequantize_block_q4_K<<<nb, 32, 0, stream>>>(vx, y);
+    const int64_t nb = k / QK_K;
+    GGML_ASSERT((uintptr_t) y % 16 == 0);
+    dequantize_block_q4_K<<<(32*nb + 255) / 256, 256, 0, stream>>>(vx, y, nb);
 }
 
 template<typename dst_t>
 static void dequantize_row_q5_K_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
-    const int nb = k / QK_K;
-    dequantize_block_q5_K<<<nb, 64, 0, stream>>>(vx, y);
+    const int64_t nb = k / QK_K;
+    GGML_ASSERT((uintptr_t) y % 16 == 0);
+    dequantize_block_q5_K<<<(32*nb + 255) / 256, 256, 0, stream>>>(vx, y, nb);
 }
 
 template<typename dst_t>
 static void dequantize_row_q6_K_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
-    const int nb = k / QK_K;
-    dequantize_block_q6_K<<<nb, 64, 0, stream>>>(vx, y);
+    const int64_t nb = k / QK_K;
+    GGML_ASSERT((uintptr_t) y % 16 == 0);
+    dequantize_block_q6_K<<<(32*nb + 255) / 256, 256, 0, stream>>>(vx, y, nb);
 }
 
 template<typename dst_t>

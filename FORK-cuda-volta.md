@@ -19,6 +19,7 @@ Back to the [fork overview](https://github.com/karelfridrich/llama.cpp#readme).
 | quantize the MoE input once | Routed and shared experts share one input quantization even when they can't share a kernel | Flint 123.9 -> 125.1 |
 | plain K/V loads in Volta flash attention | Since upstream #29510 the K/V tile loader checks for `kv_rows` per element. `kv_rows` needs Turing MMA and never reaches Volta, so Volta builds only the plain path | Gemma 4 31B pp512 at 16k 441 -> 492, Qwen3.8 27B 687 -> 722 |
 | MMVF for unquantized MoE experts | BF16/F16 expert weights at small batch had no kernel on NVIDIA without a matching MMF (BF16 before Ampere) and took the synchronizing fallback, which turns CUDA graphs off for the whole model. Use MMVF there, as AMD already does | Inkling 2 Mini UD-Q8_K_XL (BF16 experts in 4 layers) tg 26.8 -> 31.3 |
+| vectorized dequantization to FP16 | Batched matmuls of dense models dequantize the weights to FP16 for cuBLAS once per ubatch. The Q4_0, Q4_K, Q5_K and Q6_K kernels wrote scattered 2-byte values from 32- or 64-thread blocks; now each thread writes 8 consecutive values with one 16-byte store, in 256-thread blocks. Not Volta-specific | pp2048 (ubatch 512): Gemma 4 31B Q4_0 689 -> 825, Qwen3.8 27B Q4_K/Q5_K 860 -> 1007; MoE models unchanged |
 
 Now upstream, dropped in the November 2026 rebase: MMQ for MoE prefill (upstream uses MMQ for every MoE model on
 NVIDIA) and the sm70 flash-attention config for 256-wide heads (PR #27997).
