@@ -2645,7 +2645,8 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
         } else if (src0->type == GGML_TYPE_F8_E4M3 &&
                 ggml_cuda_should_use_mmvf(src0, cc, warp_size, dst->ne[2])) {
             return false;
-        } else if (src0->type != GGML_TYPE_F8_E4M3 && GGML_CUDA_CC_IS_AMD(cc) && src0->ne[0] % 2 == 0) {
+        } else if (src0->type != GGML_TYPE_F8_E4M3 && src0->ne[0] % 2 == 0 && (GGML_CUDA_CC_IS_AMD(cc) ||
+                !ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true))) {
             return false;
         }
     }
@@ -2697,7 +2698,9 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
                 return;
             } else {
                 // MMVF reads src0 in pairs of values, so it needs an even number of columns
-                if (src0->type != GGML_TYPE_F8_E4M3 && GGML_CUDA_CC_IS_AMD(cc) && ne00 % 2 == 0) {
+                // also on NVIDIA when MMF can not take the type (f.ex. BF16 before Ampere), else the synchronizing fallback disables CUDA graphs
+                if (src0->type != GGML_TYPE_F8_E4M3 && ne00 % 2 == 0 && (GGML_CUDA_CC_IS_AMD(cc) ||
+                        !ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true))) {
                     ggml_cuda_mul_mat_vec_f(ctx, src0, src1, ids, dst);
                     return;
                 }
